@@ -343,11 +343,13 @@ ignore = [
 [tool.hatch.build.targets.sdist]
 packages = [
   "cosmos_framework",
+  "greenwam",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = [
   "cosmos_framework",
+  "greenwam",
 ]
 exclude = [
   "*_test.py",

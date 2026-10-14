@@ -52,3 +52,15 @@ Notice:
   Upstream source files do not contain an explicit copyright notice.
 Files:
   cosmos_framework/model/generator/utils/taylorseer.py
+
+GreenWAM
+Copyright (c) 2026 Sber Robotics Center.
+GreenWAM changes and additions to Cosmos-Framework are released under OpenMDW-1.1 (LICENSE).
+
+WorldArena 2.0 evaluator
+Source: https://github.com/WorldArena2/WorldArena-2.0
+License: MIT (benchmarks/worldarena/evaluator/LICENSE-WorldArena-2.0)
+Notice:
+  Copyright (c) 2026 worldarenav2
+Files (patches against the evaluator, applied by benchmarks/worldarena/evaluator/setup.sh):
+  benchmarks/worldarena/evaluator/patches/*.patch
