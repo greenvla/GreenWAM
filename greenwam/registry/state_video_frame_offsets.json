@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "semantics": "Per-layout shift, in native frames, between the parquet rows (state/action/state_valid_mask) and the video frames. The measured columns for video frame v are read from parquet row v + offset, clamped to the episode; timestamps and video stay on the video clock. Negative = proprio was recorded ahead of the pixels. Layouts absent here have offset 0.",
+  "evidence": "Measured by aligning parquet observation.state with video motion at stride 1 over 60 episodes per layout; GM100_AgileX is the zero control (mode 0, MAD 0).",
+  "offsets": {
+    "agibotworld2026__g2a__162__162": -2,
+    "gm100__agibot_g1__43__43": -1
+  }
+}

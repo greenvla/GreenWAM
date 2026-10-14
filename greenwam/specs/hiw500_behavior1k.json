@@ -1,0 +1,78 @@
+{
+  "source": [
+    "HIW-500",
+    "Behavior-1k"
+  ],
+  "layouts": [
+    {
+      "layout_id": "hiw500__unitree_g1__29__23",
+      "state_dim": 29,
+      "action_dim": 23,
+      "fps": 30,
+      "stream": "A",
+      "hours": 136.44,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": null,
+        "gripper_idx": [
+          19,
+          20,
+          21,
+          22
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "format": "xyz+euler",
+          "source": "action (or observation.state.wbc)",
+          "idx": "7-18"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "behavior1k__r1pro__61__23",
+      "state_dim": 61,
+      "action_dim": 23,
+      "fps": 30,
+      "stream": "A",
+      "hours": 82.38,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          3,
+          4,
+          5,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21
+        ],
+        "gripper_idx": [
+          14,
+          22
+        ],
+        "drop_idx": [
+          6
+        ],
+        "eef_for_native_head": {
+          "format": "xyz+quat",
+          "source": "observation.state",
+          "idx": "17-23, 42-48"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    }
+  ]
+}

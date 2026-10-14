@@ -1,0 +1,331 @@
+{
+  "cap": 32,
+  "free_slots": [
+    31
+  ],
+  "release_match": {
+    "AgiBotWorld-2026": [
+      "agibotworld",
+      15,
+      29
+    ],
+    "GenieSim 3.0": [
+      "geniesim3_g2a",
+      15,
+      29
+    ],
+    "Behavior-1k": [
+      "behavior1k_lerobot",
+      22,
+      23
+    ],
+    "ManipArena": [
+      "maniparena",
+      23,
+      20
+    ]
+  },
+  "raw_action_dim": {
+    "humanoid_a_v14__humanoid_a__51__52": {
+      "raw_action_dim": 52,
+      "hours": 202.13,
+      "stream": "B",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "agibotworld2026__g2a__162__162": {
+      "raw_action_dim": 162,
+      "hours": 155.4,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": 15
+    },
+    "hiw500__unitree_g1__29__23": {
+      "raw_action_dim": 23,
+      "hours": 136.44,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "interndata_a1__arx_lift2__77__70": {
+      "raw_action_dim": 70,
+      "hours": 105.8,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "geniesim3__g2a__186__40": {
+      "raw_action_dim": 40,
+      "hours": 98.55,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": 15
+    },
+    "gm100__agibot_g1__43__43": {
+      "raw_action_dim": 43,
+      "hours": 90.06,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "groot_gr1__gr1t1__44__44": {
+      "raw_action_dim": 44,
+      "hours": 87.89,
+      "stream": "B",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "gm100__agilex_cobot_magic__54__54": {
+      "raw_action_dim": 54,
+      "hours": 83.18,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "behavior1k__r1pro__61__23": {
+      "raw_action_dim": 23,
+      "hours": 82.38,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": 22
+    },
+    "interndata_a1__agilex_split_aloha__77__70": {
+      "raw_action_dim": 70,
+      "hours": 75.96,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "galaxea__r1lite__64__26": {
+      "raw_action_dim": 26,
+      "hours": 69.34,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "robocoin__agilex_cobot_decoupled_magic_fk_eef_armbase__26__26": {
+      "raw_action_dim": 26,
+      "hours": 67.24,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "interndata_a1__genie1__79__72": {
+      "raw_action_dim": 72,
+      "hours": 58.15,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin__realman_rmc_aidal_fk_eef_armbase__28__28": {
+      "raw_action_dim": 28,
+      "hours": 57.69,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "dual_arm_b__dual_arm_b__33__34": {
+      "raw_action_dim": 34,
+      "hours": 46.911,
+      "stream": "B",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robomind_v1__tienkung_gello__30__30": {
+      "raw_action_dim": 30,
+      "hours": 38.4,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "dual_arm_b__dual_arm_b__47__48": {
+      "raw_action_dim": 48,
+      "hours": 33.109,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin__leju_robot__132__132": {
+      "raw_action_dim": 132,
+      "hours": 29.99,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robomind_v1__tienkung_xsens__40__40": {
+      "raw_action_dim": 40,
+      "hours": 19.85,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin__galaxea_r1_lite_fk_eef_armbase__26__26": {
+      "raw_action_dim": 26,
+      "hours": 16.34,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "humanoid_everyday__unitree_h1__79__79": {
+      "raw_action_dim": 79,
+      "hours": 12.5,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "unitree_g1_c__wbt_inspire__60__60": {
+      "raw_action_dim": 60,
+      "hours": 12.46,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "unitree_catalog__unitree_g1_dex1__83__97": {
+      "raw_action_dim": 97,
+      "hours": 11.92,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "humanoid_a_sim__humanoid_a__51__52": {
+      "raw_action_dim": 52,
+      "hours": 11.5,
+      "stream": "B",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "humanoid_everyday__unitree_g1__155__155": {
+      "raw_action_dim": 155,
+      "hours": 11.28,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin__ruantong_a2d_fk_eef_armbase__41__41": {
+      "raw_action_dim": 41,
+      "hours": 10.1,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "g1_ikea__unitree_g1_dex1__50__50": {
+      "raw_action_dim": 50,
+      "hours": 9.83,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "robocoin__discover_robotics_aitbot_mmk2__50__50": {
+      "raw_action_dim": 50,
+      "hours": 7.78,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "unitree_g1_c__wbt_brainco__60__60": {
+      "raw_action_dim": 60,
+      "hours": 6.55,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "unitree_g1_c__brainco_arm__38__38": {
+      "raw_action_dim": 38,
+      "hours": 6.51,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "unitree_g1_c__dex3__40__40": {
+      "raw_action_dim": 40,
+      "hours": 6.34,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robomind2__tianyi_mobile__39__39": {
+      "raw_action_dim": 39,
+      "hours": 6.02,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin__alpha_bot_2_fk_eef_armbase__28__28": {
+      "raw_action_dim": 28,
+      "hours": 2.23,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin_g1edu__Unitree_G1edu-u3__28__28": {
+      "raw_action_dim": 28,
+      "hours": 1.99,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "unitree_g1_c__wbt_dex1__50__50": {
+      "raw_action_dim": 50,
+      "hours": 0.88,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robomind2__tianyi__30__30": {
+      "raw_action_dim": 30,
+      "hours": 0.77,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "groot_gr1__gr1t2__62__1030": {
+      "raw_action_dim": 1030,
+      "hours": 0.76,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "maniparena__ex001_6r__28__28": {
+      "raw_action_dim": 28,
+      "hours": 0.36,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": 23
+    },
+    "galaxea__r1lite__62__17": {
+      "raw_action_dim": 17,
+      "hours": 0.08,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "unitree_g1_c__dex1_all__57__57": {
+      "raw_action_dim": 57,
+      "hours": 0.01,
+      "stream": "A",
+      "pseudo_action": true,
+      "release_domain": null
+    },
+    "robocoin_g1edu__Unitree_G1edu-u3__26__26": {
+      "raw_action_dim": 26,
+      "hours": 0.01,
+      "stream": "A",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "shirt_folding__openarms_follower__16__16": {
+      "raw_action_dim": 16,
+      "hours": 0.0043,
+      "stream": "B",
+      "pseudo_action": false,
+      "release_domain": null
+    },
+    "groot_gr1__gr1t2__44__52": {
+      "raw_action_dim": 52,
+      "hours": 0.0,
+      "stream": "B",
+      "pseudo_action": false,
+      "release_domain": null
+    }
+  }
+}

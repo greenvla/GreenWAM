@@ -1,0 +1,2156 @@
+{
+  "schema_version": 1,
+  "representation": "state_eef",
+  "temporal_convention": "backward_framewise",
+  "note": "New family-specific EEF heads from paired measured states; no native Cosmos checkpoint equivalence asserted. Registry is an evidence-qualified allowlist, not a width/robot-name heuristic. Live source schema is checked by the reader. Six layouts come from README/FK-patch schemas and recorded probes; Euler rpy poses supported (rotation_format).",
+  "families": [
+    {
+      "family_id": "C08",
+      "family_key": "galaxea_r1lite_bimanual14",
+      "target_dim": 20,
+      "action_contract_id": 66
+    },
+    {
+      "family_id": "C15",
+      "family_key": "Ruantong_or_AgibotG1_20",
+      "target_dim": 20,
+      "action_contract_id": 67
+    },
+    {
+      "family_id": "C16",
+      "family_key": "Tianyi_common16",
+      "target_dim": 20,
+      "action_contract_id": 68
+    },
+    {
+      "family_id": "C17",
+      "family_key": "Tienkung_common_arm14",
+      "target_dim": 32,
+      "action_contract_id": 69
+    },
+    {
+      "family_id": "C18",
+      "family_key": "G1_body29",
+      "target_dim": 32,
+      "action_contract_id": 70
+    },
+    {
+      "family_id": "C19",
+      "family_key": "H1_body27_inspire12",
+      "target_dim": 30,
+      "action_contract_id": 71
+    },
+    {
+      "family_id": "C20",
+      "family_key": "DualArmB_ARX5_common14",
+      "target_dim": 20,
+      "action_contract_id": 72
+    },
+    {
+      "family_id": "C13",
+      "family_key": "piper_bimanual14_eef",
+      "target_dim": 20,
+      "action_contract_id": 73
+    },
+    {
+      "family_id": "C14",
+      "family_key": "Realman_Aidal16_eef",
+      "target_dim": 20,
+      "action_contract_id": 74
+    },
+    {
+      "family_id": "C05",
+      "family_key": "AlphaBot2_16_eef",
+      "target_dim": 20,
+      "action_contract_id": 75
+    }
+  ],
+  "layouts": [
+    {
+      "layout_id": "galaxea__r1lite__64__26",
+      "family_id": "C08",
+      "roots": 219,
+      "atoms": 41639,
+      "sources": [
+        "Galaxea Open-World"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 64,
+        "source_columns": [
+          "observation.state.left_arm",
+          "observation.state.left_arm.velocities",
+          "observation.state.right_arm",
+          "observation.state.right_arm.velocities",
+          "observation.state.left_gripper",
+          "observation.state.right_gripper",
+          "observation.state.torso",
+          "observation.state.torso.velocities",
+          "observation.state.chassis",
+          "observation.state.chassis.velocities",
+          "observation.state.chassis.imu",
+          "observation.state.left_ee_pose",
+          "observation.state.right_ee_pose"
+        ],
+        "source_column_shapes": {
+          "observation.state.left_arm": [
+            6
+          ],
+          "observation.state.left_arm.velocities": [
+            6
+          ],
+          "observation.state.right_arm": [
+            6
+          ],
+          "observation.state.right_arm.velocities": [
+            6
+          ],
+          "observation.state.left_gripper": [
+            1
+          ],
+          "observation.state.right_gripper": [
+            1
+          ],
+          "observation.state.torso": [
+            4
+          ],
+          "observation.state.torso.velocities": [
+            4
+          ],
+          "observation.state.chassis": [
+            3
+          ],
+          "observation.state.chassis.velocities": [
+            3
+          ],
+          "observation.state.chassis.imu": [
+            10
+          ],
+          "observation.state.left_ee_pose": [
+            7
+          ],
+          "observation.state.right_ee_pose": [
+            7
+          ]
+        },
+        "pose_indices": [
+          [
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56
+          ],
+          [
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 24,
+            "target_slot": 18,
+            "scale": 0.01,
+            "offset": 0,
+            "valid_range": [
+              0,
+              100
+            ],
+            "unit": "open_fraction",
+            "available": true
+          },
+          {
+            "source_index": 25,
+            "target_slot": 19,
+            "scale": 0.01,
+            "offset": 0,
+            "valid_range": [
+              0,
+              100
+            ],
+            "unit": "open_fraction",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "source left/right arm base; exact URDF link unconfirmed",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/galaxea.json",
+            "sha256": "7c344b4cc5a134aaf047b5021891ad987333a00216dcd064a659f9f53c441bb7",
+            "finding": {
+              "idx": "50-63",
+              "format": "xyz+quat(xyzw) x2",
+              "frame": "arm base (rigidly attached to the torso; NOT world, NOT the chassis)",
+              "units": "m",
+              "evidence": "|q| = 1.000000 (median), share of frames with ||q|-1| < 1e-3 = 1.0000 in all 12 roots; with the arm frozen and the TORSO moving, median |Δp| = 0.0000 mm, p90 = 0.0036 mm (n=394 frames); with the CHASSIS moving p50 = 0.0000, p90 = 0.0039 mm (n=200); with the arm moving p50 = 7.94 mm/frame (n=6863) -> the reference frame is attached to the body above the torso"
+            }
+          },
+          {
+            "path": "greenwam/specs/galaxea.json",
+            "sha256": "7c344b4cc5a134aaf047b5021891ad987333a00216dcd064a659f9f53c441bb7",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "galaxea__r1lite__62__17",
+      "family_id": "C08",
+      "roots": 3,
+      "atoms": 59,
+      "sources": [
+        "Galaxea Open-World"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 62,
+        "source_columns": [
+          "observation.state.left_arm",
+          "observation.state.left_arm.velocities",
+          "observation.state.right_arm",
+          "observation.state.right_arm.velocities",
+          "observation.state.left_gripper",
+          "observation.state.right_gripper",
+          "observation.state.torso",
+          "observation.state.torso.velocities",
+          "observation.state.chassis",
+          "observation.state.left_ee_pose",
+          "observation.state.right_ee_pose"
+        ],
+        "source_column_shapes": {
+          "observation.state.left_arm": [
+            7
+          ],
+          "observation.state.left_arm.velocities": [
+            7
+          ],
+          "observation.state.right_arm": [
+            7
+          ],
+          "observation.state.right_arm.velocities": [
+            7
+          ],
+          "observation.state.left_gripper": [
+            1
+          ],
+          "observation.state.right_gripper": [
+            1
+          ],
+          "observation.state.torso": [
+            4
+          ],
+          "observation.state.torso.velocities": [
+            4
+          ],
+          "observation.state.chassis": [
+            10
+          ],
+          "observation.state.left_ee_pose": [
+            7
+          ],
+          "observation.state.right_ee_pose": [
+            7
+          ]
+        },
+        "pose_indices": [
+          [
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54
+          ],
+          [
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 28,
+            "target_slot": 18,
+            "scale": 0.01,
+            "offset": 0,
+            "valid_range": [
+              0,
+              100
+            ],
+            "unit": "open_fraction",
+            "available": true
+          },
+          {
+            "source_index": 29,
+            "target_slot": 19,
+            "scale": 0.01,
+            "offset": 0,
+            "valid_range": [
+              0,
+              100
+            ],
+            "unit": "open_fraction",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "source left/right arm base; exact URDF link unconfirmed",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/galaxea.json",
+            "sha256": "7c344b4cc5a134aaf047b5021891ad987333a00216dcd064a659f9f53c441bb7",
+            "finding": {
+              "idx": "48-61",
+              "format": "xyz+quat(xyzw) x2",
+              "frame": "arm base",
+              "units": "m",
+              "evidence": "|q| = 1.000000, share of ||q|-1| < 1e-3 = 1.0000; xyz ranges match L1 (left y > 0, right y < 0)"
+            }
+          },
+          {
+            "path": "greenwam/specs/galaxea.json",
+            "sha256": "7c344b4cc5a134aaf047b5021891ad987333a00216dcd064a659f9f53c441bb7",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robocoin__ruantong_a2d_fk_eef_armbase__41__41",
+      "family_id": "C15",
+      "roots": 1,
+      "atoms": 8516,
+      "sources": [
+        "RoboCOIN"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 41,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            41
+          ]
+        },
+        "pose_indices": [
+          [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20
+          ],
+          [
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 32,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_normalized_position",
+            "available": true
+          },
+          {
+            "source_index": 33,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_normalized_position",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arm_l_base_link / arm_r_base_link; gripper_l/r_base_link TCP",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robocoin.json",
+            "sha256": "d40be95911869a7a3f428d71ede4b58d9b14e1b61d9f0b30574fc744adcb88e8",
+            "finding": {
+              "idx": "14-27",
+              "format": "xyz+quat(xyzw) x2 (L,R)",
+              "frame": "arm_base_link",
+              "units": "m",
+              "evidence": "info.eef_pose_source.method='FK from G1_omnipicker.urdf', base arm_l/arm_r_base_link; |quat| = 1.000000 with std = 0.0 over both quadruples (17-20, 24-27); corr(|Δq|,|Δp_eef|)=0.957, joints and EEF both move in 100% of frames"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robocoin/robocoin_agibot_g1.json",
+            "sha256": "7e22a48777b39d013511e4aea591a48cffb7b011ad767751ef453b6e466fd2fc",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "dual_arm_b__dual_arm_b__47__48",
+      "family_id": "C20",
+      "roots": 1,
+      "atoms": 29308,
+      "sources": [
+        "Dual-arm B 20K"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 47,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            47
+          ]
+        },
+        "pose_indices": [
+          [
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ],
+          [
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 7,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_fraction",
+            "available": true
+          },
+          {
+            "source_index": 15,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_fraction",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arx5_left/right_base_link -> arx5_left/right_eef_link",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/dual_arm_b.json",
+            "sha256": "570f04c9d3debebe6722bda37b7028348d159f3ce316bc692eab9c06f58c692a",
+            "finding": {
+              "idx": "33-46",
+              "format": "xyz + quat_xyzw, 7 per arm (left 33-39, right 40-46)",
+              "frame": "arx5_left_base_link for the left arm, arx5_right_base_link for the right — DIFFERENT bases, no common frame",
+              "units": "m + unit quaternion",
+              "derived": "FK of the same joints, carries no independent information",
+              "evidence": "meta/info.json patches[0] = arm-base EEF FK patch of dual-arm B, applied_at 2026-06-11, URDF of the dual-arm B torso-up body, targets arx5_left/right_eef_link, finger joints are not in the FK. Numeric check on 3 858 frames: |quat| = 1.0 with max deviation 1.17e-7 on both arms; corr(sum of |Δq| over 6 joints, |Δp_eef|) = 0.873 left and 0.859 right; frames with |Δp_eef| > 1 mm: 49.7 % left and 54.8 % right. xyz ranges: left x [0.115, 0.645], y [-0.269, 0.120], z [-0.183, 0.312] m."
+            }
+          },
+          {
+            "path": "greenwam/probes/out_worker/worker_20k_success.json",
+            "sha256": "b6831d00464ccf4e307613f221288bc52800c7c76f0ecbfe540c3121ffb399a3",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robomind_v1__tienkung_gello__30__30",
+      "family_id": "C17",
+      "roots": 2,
+      "atoms": 32718,
+      "sources": [
+        "RoboMIND"
+      ],
+      "recipe": {
+        "target_dim": 32,
+        "raw_state_width": 30,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            30
+          ]
+        },
+        "pose_indices": [
+          [
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          [
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 7,
+            "target_slot": 30,
+            "scale": -1,
+            "offset": 1,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "open_fraction",
+            "available": false
+          },
+          {
+            "source_index": 15,
+            "target_slot": 31,
+            "scale": -1,
+            "offset": 1,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "open_fraction",
+            "available": false
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "left/right_link0 -> left/right_link7",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          },
+          {
+            "group": "master_grippers",
+            "reason": "Both source indices 7 and 15 originate from master joint_position, not measured follower grippers (reports/robomind_tail.md:52-55). Mask both; range/polarity calibration cannot establish measured robot state. FK arm poses remain qualified."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robomind_tail.json",
+            "sha256": "7993fe332b4f9c304adad497503a2a5d63bf8aacd1f7ee71e563f73099bf56d9",
+            "finding": {
+              "idx": "16-29",
+              "format": "xyz+quat_xyzw x2 (L, R)",
+              "frame": "DIFFERENT for the left and right arm: left_link0 and right_link0",
+              "units": "m + unit quaternion",
+              "evidence": "meta/robomind_v1_tienkung_link7_armbase_eef_report.json: FK by humanoid.urdf, target left_link7 / right_link7, base left_link0 / right_link0, orientation_type = quaternion_xyzw, hand_or_gripper_joints_in_fk = false. |quat| = 1.0000000 +- 1.7e-8 (min 0.99999996, max 1.00000004) on both arms; corr(|dEEF_xyz|, |dq_arm|) = 0.920 (Gello) and 0.977 (Prod1) on 11200 and 8589 frames; median EEF step 1.13 mm and 2.80 mm at median joint steps 0.0067 and 0.0150 rad"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robomind/RoboMIND_v1_TienKung_Gello_1rgb_joint_full.json",
+            "sha256": "9a93f77595ba36633fae3b7ac039f52c54b10b019d9e360745a414f62f880c3e",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robomind_v1__tienkung_xsens__40__40",
+      "family_id": "C17",
+      "roots": 1,
+      "atoms": 18026,
+      "sources": [
+        "RoboMIND"
+      ],
+      "recipe": {
+        "target_dim": 32,
+        "raw_state_width": 40,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            40
+          ]
+        },
+        "pose_indices": [
+          [
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32
+          ],
+          [
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 7,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 8,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 9,
+            "target_slot": 20,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 10,
+            "target_slot": 21,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 11,
+            "target_slot": 22,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 12,
+            "target_slot": 23,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 20,
+            "target_slot": 24,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 21,
+            "target_slot": 25,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 22,
+            "target_slot": 26,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 23,
+            "target_slot": 27,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 24,
+            "target_slot": 28,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          },
+          {
+            "source_index": 25,
+            "target_slot": 29,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "left/right_link0 -> left/right_link7",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          },
+          {
+            "group": "master_hand_channels",
+            "reason": "Source processing_notes derive hands from puppet/master; measured finger provenance unconfirmed, mask all 12 hand slots."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robomind_tail.json",
+            "sha256": "7993fe332b4f9c304adad497503a2a5d63bf8aacd1f7ee71e563f73099bf56d9",
+            "finding": {
+              "idx": "26-39",
+              "format": "xyz+quat_xyzw x2 (L, R)",
+              "frame": "left_link0 and right_link0 (different frames for the two arms)",
+              "units": "m + unit quaternion",
+              "evidence": "the same patch robomind_v1_tienkung_link7_armbase_eef (base_dim 26 -> patched_dim 40); |quat| = 1.0000000 +- 1.7e-8; corr(|dEEF_xyz|, |dq_arm|) = 0.945 on 11486 frames; median EEF step 0.89 mm at joint step 0.0069 rad; hand_or_gripper_joints_in_fk = false — the fingers are not in the FK"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robomind/RoboMIND_v1_TienKung_Xsens_1rgb_joint_hand_full.json",
+            "sha256": "6dc396cbf28caf83ac6190d28a5275a5a5a6dc8e53188b986674e56920135e98",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robomind2__tianyi_mobile__39__39",
+      "family_id": "C16",
+      "roots": 1,
+      "atoms": 5432,
+      "sources": [
+        "RoboMIND"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 39,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            39
+          ]
+        },
+        "pose_indices": [
+          [
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31
+          ],
+          [
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 14,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_normalized_position",
+            "available": true
+          },
+          {
+            "source_index": 15,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_normalized_position",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "body_yaw_link -> wrist_roll_l/r_link",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robomind_tail.json",
+            "sha256": "7993fe332b4f9c304adad497503a2a5d63bf8aacd1f7ee71e563f73099bf56d9",
+            "finding": {
+              "idx": "25-38",
+              "format": "xyz+quat_xyzw x2 (L, R)",
+              "frame": "body_yaw_link — ONE common frame for both arms",
+              "units": "m + unit quaternion",
+              "evidence": "meta/tianyi_mobile_armbase_eef_report.json: FK by tianyi2.0_urdf_with_hands.urdf, base body_yaw_link, target wrist_roll_l_link / wrist_roll_r_link, orientation_type quat_xyzw. |quat| = 1.0000000 +- 1.6e-8; corr(|dEEF_xyz|, |dq_arm|) = 0.959; left arm y in [0.040, 0.362], right y in [-0.323, -0.210] — the signs mirror about the body, as expected for a common frame"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robomind/RoboMIND2.0_Tianyi_mobile_joint_topcam_fps20.json",
+            "sha256": "7da794cd673c715e15891cad13400c02f15af974862dd5c1e65d65ce74f7f01e",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_h1__79__79",
+      "family_id": "C19",
+      "roots": 1,
+      "atoms": 14627,
+      "sources": [
+        "Humanoid Everyday"
+      ],
+      "recipe": {
+        "target_dim": 30,
+        "raw_state_width": 79,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            79
+          ]
+        },
+        "pose_indices": [
+          [
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71
+          ],
+          [
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 53,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 54,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 55,
+            "target_slot": 20,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 56,
+            "target_slot": 21,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 57,
+            "target_slot": 22,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 58,
+            "target_slot": 23,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 59,
+            "target_slot": 24,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 60,
+            "target_slot": 25,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 61,
+            "target_slot": 26,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 62,
+            "target_slot": 27,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 63,
+            "target_slot": 28,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": true
+          },
+          {
+            "source_index": 64,
+            "target_slot": 29,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": [
+              0,
+              1
+            ],
+            "unit": "source_hand_position",
+            "available": false
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "torso_link -> left/right_base_link with fixed hand offset",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          },
+          {
+            "group": "right_hand_joint_6",
+            "reason": "Source index64 constant0.761; masked."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robomind_tail.json",
+            "sha256": "7993fe332b4f9c304adad497503a2a5d63bf8aacd1f7ee71e563f73099bf56d9",
+            "finding": {
+              "idx": "65-78",
+              "format": "xyz+quat_xyzw x2 (L, R)",
+              "frame": "torso_link — ONE common frame for both arms",
+              "units": "m + unit quaternion",
+              "evidence": "meta/humanoid_everyday_h1_torso_eef_report.json: FK by h1_2_with_FTP_hand.urdf, base torso_link, target left_base_link / right_base_link, hand_joints_in_fk = false, fixed_hand_base_offset_included = true. |quat| = 1.0000000 +- 1.7e-8; corr(|dEEF_xyz|, |dq_arm|) = 0.883; median EEF step 4.20 mm at joint step 0.0238 rad"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robomind/Humanoid_Everyday_h1_compact.json",
+            "sha256": "f0b2443753b97478ec1264bd6c9e2456e086d1bf7599d4a5d7383a811463d60d",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_g1__155__155",
+      "family_id": "C18",
+      "roots": 1,
+      "atoms": 12456,
+      "sources": [
+        "Humanoid Everyday"
+      ],
+      "recipe": {
+        "target_dim": 32,
+        "raw_state_width": 155,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            155
+          ]
+        },
+        "pose_indices": [
+          [
+            141,
+            142,
+            143,
+            144,
+            145,
+            146,
+            147
+          ],
+          [
+            148,
+            149,
+            150,
+            151,
+            152,
+            153,
+            154
+          ]
+        ],
+        "hand_channels": [
+          {
+            "source_index": 55,
+            "target_slot": 18,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 56,
+            "target_slot": 19,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 57,
+            "target_slot": 20,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 58,
+            "target_slot": 21,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 59,
+            "target_slot": 22,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 60,
+            "target_slot": 23,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 61,
+            "target_slot": 24,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 62,
+            "target_slot": 25,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 63,
+            "target_slot": 26,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 64,
+            "target_slot": 27,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 65,
+            "target_slot": 28,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 66,
+            "target_slot": 29,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 67,
+            "target_slot": 30,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          },
+          {
+            "source_index": 68,
+            "target_slot": 31,
+            "scale": 1,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "rad",
+            "available": true
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "torso_link -> left/right_rubber_hand with fixed palm offset",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "greenwam/specs/robomind_tail.json",
+            "sha256": "7993fe332b4f9c304adad497503a2a5d63bf8aacd1f7ee71e563f73099bf56d9",
+            "finding": {
+              "idx": "141-154",
+              "format": "xyz+quat_xyzw x2 (L, R)",
+              "frame": "torso_link — one common frame",
+              "units": "m + unit quaternion",
+              "evidence": "meta/humanoid_everyday_g1_torso_eef_report.json: FK by g1_29dof.urdf, base torso_link, target left_rubber_hand / right_rubber_hand, hand_joints_in_fk = false, fixed_palm_offset_included = true. |quat| = 1.0000000 +- 1.6e-8; corr(|dEEF_xyz|, |dq_arm|) = 0.941; median EEF step 2.96 mm"
+            }
+          },
+          {
+            "path": "greenwam/probes/out_robomind/Humanoid_Everyday_g1_compact.json",
+            "sha256": "ab4887586b9f6bd7898ebbf248727391427c182b5d4d91ed812392b33c3af16f",
+            "finding": "Captured source schema, quaternion and pose/joint motion probes; see source metadata provenance in the spec."
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "gm100__agilex_cobot_magic__54__54",
+      "family_id": "C13",
+      "roots": 1,
+      "atoms": 65769,
+      "sources": [
+        "GM-100"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 54,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            54
+          ]
+        },
+        "pose_indices": [
+          [
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46
+          ],
+          [
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53
+          ]
+        ],
+        "rotation_format": "quat_xyzw",
+        "hand_channels": [
+          {
+            "source_index": 36,
+            "target_slot": 18,
+            "scale": 11.11111111111111,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "GM-100 README: gripper position (metres); larger = open; scale by ~0.09 m gap"
+          },
+          {
+            "source_index": 37,
+            "target_slot": 19,
+            "scale": 11.11111111111111,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "same"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "left_base_link / right_base_link -> left/right_gripper_center (README: FK from agilex_aloha.urdf)",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "40-46 / 47-53",
+              "format": "xyz(m)+quat(x,y,z,w) x2, names left_eef_left_base_pos_x_m .. right_eef_right_base_quat_w",
+              "evidence": {
+                "left": {
+                  "quat_norm_mean": 1.0,
+                  "quat_norm_std": 0.0,
+                  "corr_dq_dpos": 1.0,
+                  "moving_frac": 0.003,
+                  "pos_moves_when_joints_still": 0.0
+                },
+                "right": {
+                  "quat_norm_mean": 1.0,
+                  "quat_norm_std": 0.0,
+                  "corr_dq_dpos": 0.823,
+                  "moving_frac": 0.611,
+                  "pos_moves_when_joints_still": 0.0
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robomind2__tianyi__30__30",
+      "family_id": "C16",
+      "roots": 1,
+      "atoms": 520,
+      "sources": [
+        "RoboMIND"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 30,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            30
+          ]
+        },
+        "pose_indices": [
+          [
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          [
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29
+          ]
+        ],
+        "rotation_format": "quat_xyzw",
+        "hand_channels": [
+          {
+            "source_index": 14,
+            "target_slot": 18,
+            "scale": 1.0,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_normalized_position",
+            "available": true,
+            "note": "RoboMIND2 scalar gripper 0..1, 1 = open (idle)"
+          },
+          {
+            "source_index": 15,
+            "target_slot": 19,
+            "scale": 1.0,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_normalized_position",
+            "available": true,
+            "note": "same"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "xyzw",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "left_link0 -> left_link7 / right_link0 -> right_link7 (README: EEF patched from TienKung Pro URDF)",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "16-22 / 23-29",
+              "format": "xyz+quat(qx,qy,qz,qw) x2 per README",
+              "evidence": {
+                "left": {
+                  "quat_norm_mean": 1.0,
+                  "quat_norm_std": 0.0,
+                  "corr_dq_dpos": 0.864,
+                  "moving_frac": 0.996,
+                  "pos_moves_when_joints_still": 0.0
+                },
+                "right": {
+                  "quat_norm_mean": 1.0,
+                  "quat_norm_std": 0.0,
+                  "corr_dq_dpos": 0.591,
+                  "moving_frac": 0.572,
+                  "pos_moves_when_joints_still": 0.0
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robocoin__agilex_cobot_decoupled_magic_fk_eef_armbase__26__26",
+      "family_id": "C13",
+      "roots": 1,
+      "atoms": 78820,
+      "sources": [
+        "RoboCOIN"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 26,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            26
+          ]
+        },
+        "pose_indices": [
+          [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19
+          ],
+          [
+            20,
+            21,
+            22,
+            23,
+            24,
+            25
+          ]
+        ],
+        "rotation_format": "euler_rpy_rad",
+        "hand_channels": [
+          {
+            "source_index": 6,
+            "target_slot": 18,
+            "scale": 1.0,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_normalized_position",
+            "available": true,
+            "note": "RoboCOIN left_gripper_open; larger = open"
+          },
+          {
+            "source_index": 13,
+            "target_slot": 19,
+            "scale": 1.0,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_normalized_position",
+            "available": true,
+            "note": "right_gripper_open"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "not_applicable",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arm_base_link per arm; FK patch euler_x/y/z_rad = URDF rpy (extrinsic xyz)",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "14-19 / 20-25",
+              "format": "xyz(m)+euler rpy(rad) x2",
+              "evidence": {
+                "left": {
+                  "corr_dq_dpos": 0.89,
+                  "moving_frac": 0.87,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.916
+                },
+                "right": {
+                  "corr_dq_dpos": 0.878,
+                  "moving_frac": 0.905,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.884
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robocoin__realman_rmc_aidal_fk_eef_armbase__28__28",
+      "family_id": "C14",
+      "roots": 1,
+      "atoms": 46574,
+      "sources": [
+        "RoboCOIN"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 28,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            28
+          ]
+        },
+        "pose_indices": [
+          [
+            22,
+            23,
+            24,
+            25,
+            26,
+            27
+          ],
+          [
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        ],
+        "rotation_format": "euler_rpy_rad",
+        "hand_channels": [
+          {
+            "source_index": 21,
+            "target_slot": 18,
+            "scale": 0.001,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "RoboCOIN left_gripper_open 0..1000; larger = open"
+          },
+          {
+            "source_index": 7,
+            "target_slot": 19,
+            "scale": 0.001,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "right_gripper_open 0..1000"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "not_applicable",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arm_base_link per arm (right block precedes left in the state); FK patch euler = URDF rpy",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "22-27 (L) / 8-13 (R)",
+              "format": "xyz(m)+euler rpy(rad) x2",
+              "evidence": {
+                "left": {
+                  "corr_dq_dpos": 0.842,
+                  "moving_frac": 0.941,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.933
+                },
+                "right": {
+                  "corr_dq_dpos": 0.809,
+                  "moving_frac": 0.947,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.875
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robocoin__galaxea_r1_lite_fk_eef_armbase__26__26",
+      "family_id": "C08",
+      "roots": 1,
+      "atoms": 14456,
+      "sources": [
+        "RoboCOIN"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 26,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            26
+          ]
+        },
+        "pose_indices": [
+          [
+            14,
+            15,
+            16,
+            17,
+            18,
+            19
+          ],
+          [
+            20,
+            21,
+            22,
+            23,
+            24,
+            25
+          ]
+        ],
+        "rotation_format": "euler_rpy_rad",
+        "hand_channels": [
+          {
+            "source_index": 6,
+            "target_slot": 18,
+            "scale": 0.5882352941176471,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "RoboCOIN left_gripper_open, sampled max 1.70; larger = open"
+          },
+          {
+            "source_index": 13,
+            "target_slot": 19,
+            "scale": 0.5882352941176471,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "right_gripper_open"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "not_applicable",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arm_base_link per arm; FK patch euler = URDF rpy",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "14-19 / 20-25",
+              "format": "xyz(m)+euler rpy(rad) x2",
+              "evidence": {
+                "left": {
+                  "corr_dq_dpos": 0.881,
+                  "moving_frac": 0.88,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.728
+                },
+                "right": {
+                  "corr_dq_dpos": 0.689,
+                  "moving_frac": 0.489,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.945
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "layout_id": "robocoin__alpha_bot_2_fk_eef_armbase__28__28",
+      "family_id": "C05",
+      "roots": 1,
+      "atoms": 1395,
+      "sources": [
+        "RoboCOIN"
+      ],
+      "recipe": {
+        "target_dim": 20,
+        "raw_state_width": 28,
+        "source_columns": [
+          "observation.state"
+        ],
+        "source_column_shapes": {
+          "observation.state": [
+            28
+          ]
+        },
+        "pose_indices": [
+          [
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          [
+            20,
+            21,
+            22,
+            23,
+            24,
+            25
+          ]
+        ],
+        "rotation_format": "euler_rpy_rad",
+        "hand_channels": [
+          {
+            "source_index": 26,
+            "target_slot": 18,
+            "scale": 0.0009900990099009901,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "RoboCOIN left_gripper_open ~0..1010; larger = open"
+          },
+          {
+            "source_index": 27,
+            "target_slot": 19,
+            "scale": 0.0009900990099009901,
+            "offset": 0,
+            "valid_range": null,
+            "unit": "source_hand_position",
+            "available": true,
+            "note": "right_gripper_open"
+          }
+        ],
+        "geometry_status": "verified_state_geometry",
+        "adapter_readiness": "qualified_from_source_schema_and_recorded_probes",
+        "runtime_calibration_fully_validated": false,
+        "position_unit": "m",
+        "quat_order": "not_applicable",
+        "quaternion_norm_tolerance": 0.001,
+        "source_frames": "arm_base_link per arm; FK patch euler = URDF rpy (FK check matched orientation with rpy2R)",
+        "temporal_convention": "backward_framewise",
+        "native_action_used": false,
+        "native_checkpoint_compatible": false,
+        "dropped_groups": [
+          {
+            "group": "non_EEF_state_channels",
+            "reason": "EEF view supervises TCP motion and qualified hands only; full joint view remains independently sampled."
+          }
+        ],
+        "evidence": [
+          {
+            "path": "EEF probes of the source data",
+            "sha256": "15ecae9707ef75f02a3ca926c4f598844c59667a1383f0762b60d2358bd6f8e8",
+            "finding": {
+              "idx": "7-12 (L) / 20-25 (R)",
+              "format": "xyz(m)+euler rpy(rad) x2",
+              "evidence": {
+                "left": {
+                  "corr_dq_dpos": 0.968,
+                  "moving_frac": 0.302,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.849
+                },
+                "right": {
+                  "corr_dq_dpos": 0.918,
+                  "moving_frac": 0.474,
+                  "pos_moves_when_joints_still": 0.0,
+                  "corr_dq_drot_deg": 0.857
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "exclusions": [
+    {
+      "layout_id": "agibotworld2026__g2a__162__162",
+      "reason": "Quaternion order and pose frame unresolved; pose/camera extrinsics do not agree."
+    },
+    {
+      "layout_id": "behavior1k__r1pro__61__23",
+      "reason": "State EEF positions and unit quaternion blocks exist, but explicit quaternion component order is not established in the available schema. Binary action grippers cannot replace the four measured finger channels."
+    },
+    {
+      "layout_id": "g1_ikea__unitree_g1_dex1__50__50",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "geniesim3__g2a__186__40",
+      "reason": "Noninterleaved state xyz/quaternion blocks require an explicit quaternion order and source pose contract; action EEF has +3-frame lag."
+    },
+    {
+      "layout_id": "gm100__agibot_g1__43__43",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "humanoid_a_sim__humanoid_a__51__52",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "groot_gr1__gr1t1__44__44",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__44__52",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__62__1030",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "hiw500__unitree_g1__29__23",
+      "reason": "Existing EEF comes from controller action; observation.state has only joints. WBC requires a separate measured-pose provenance/rotation audit; trigger/squeeze leak source commands."
+    },
+    {
+      "layout_id": "interndata_a1__agilex_split_aloha__77__70",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "interndata_a1__arx_lift2__77__70",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "interndata_a1__genie1__79__72",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "maniparena__ex001_6r__28__28",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "robocoin__discover_robotics_aitbot_mmk2__50__50",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "robocoin__leju_robot__132__132",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__26__26",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__28__28",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "humanoid_a_v14__humanoid_a__51__52",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "shirt_folding__openarms_follower__16__16",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_catalog__unitree_g1_dex1__83__97",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__brainco_arm__38__38",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__dex1_all__57__57",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__dex3__40__40",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_brainco__60__60",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_dex1__50__50",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_inspire__60__60",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    },
+    {
+      "layout_id": "dual_arm_b__dual_arm_b__33__34",
+      "reason": "Not yet qualified for this measured-state quaternion contract: requires explicit pose field/order/frame/units evidence or an audited Euler/rot6d/FK adapter. Joint representation remains available under its existing coverage rules."
+    }
+  ]
+}

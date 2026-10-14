@@ -1,0 +1,251 @@
+{
+  "source": [
+    "RoboCOIN",
+    "RoboCOIN G1edu"
+  ],
+  "layouts": [
+    {
+      "layout_id": "robocoin__agilex_cobot_decoupled_magic_fk_eef_armbase__26__26",
+      "state_dim": 26,
+      "action_dim": 26,
+      "fps": 30,
+      "stream": "A",
+      "hours": 67.24,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-5,7-12",
+        "gripper_idx": [
+          6,
+          13
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "14-25"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "14-25",
+          "format": "xyz+euler x2 (L,R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__realman_rmc_aidal_fk_eef_armbase__28__28",
+      "state_dim": 28,
+      "action_dim": 28,
+      "fps": 30,
+      "stream": "A",
+      "hours": 57.69,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-6,14-20",
+        "gripper_idx": [
+          7,
+          21
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "8-13,22-27"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "8-13,22-27",
+          "format": "xyz+euler (right), xyz+euler (left)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__leju_robot__132__132",
+      "state_dim": 132,
+      "action_dim": 132,
+      "fps": 30,
+      "stream": "A",
+      "hours": 29.99,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": [
+          26,
+          32
+        ],
+        "drop_idx": "28-31,34-37 (bitwise duplicates), 40-95 (velocities and torques), 108-117 (IMU), 39 (dead head)",
+        "eef_for_native_head": {
+          "idx": "118-131"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "96-107",
+          "format": "xyz x2 then euler x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__galaxea_r1_lite_fk_eef_armbase__26__26",
+      "state_dim": 26,
+      "action_dim": 26,
+      "fps": 30,
+      "stream": "A",
+      "hours": 16.34,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-5,7-12",
+        "gripper_idx": [
+          6,
+          13
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "14-25"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "14-25",
+          "format": "xyz+euler x2 (L,R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__ruantong_a2d_fk_eef_armbase__41__41",
+      "state_dim": 41,
+      "action_dim": 41,
+      "fps": 30,
+      "stream": "A",
+      "hours": 10.1,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13,28-31",
+        "gripper_idx": [
+          32,
+          33
+        ],
+        "drop_idx": "34-40 (base pose: 3 global constants + 1 within-episode + 3 nearly static)",
+        "eef_for_native_head": {
+          "idx": "14-27"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "14-27",
+          "format": "xyz+quat(xyzw) x2 (L,R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__discover_robotics_aitbot_mmk2__50__50",
+      "state_dim": 50,
+      "action_dim": 50,
+      "fps": 30,
+      "stream": "A",
+      "hours": 7.78,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-11",
+        "gripper_idx": "12-35 (hand as a 24-dim block, not a gripper)",
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "36-49"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "36-49",
+          "format": "xyz+quat(xyzw) x2 (L,R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin__alpha_bot_2_fk_eef_armbase__28__28",
+      "state_dim": 28,
+      "action_dim": 28,
+      "fps": 30,
+      "stream": "A",
+      "hours": 2.23,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-6,13-19",
+        "gripper_idx": [
+          26,
+          27
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "7-12,20-25"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "7-12,20-25",
+          "format": "xyz+euler x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__28__28",
+      "state_dim": 28,
+      "action_dim": 28,
+      "fps": 30,
+      "stream": "A",
+      "hours": 1.99,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": "14-27 (Dex3 hand, 7 dims per side)",
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "eef_sim_pose_state[0:12]"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "outside observation.state: column eef_sim_pose_state[0:12]",
+          "format": "xyz+euler x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__26__26",
+      "state_dim": 26,
+      "action_dim": 26,
+      "fps": 30,
+      "stream": "A",
+      "hours": 0.01,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": "14-25",
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "eef_sim_pose_state[0:12]"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "outside observation.state: eef_sim_pose_state[0:12]",
+          "format": "xyz+euler x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    }
+  ]
+}

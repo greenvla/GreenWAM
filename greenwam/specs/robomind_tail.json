@@ -1,0 +1,286 @@
+{
+  "source": [
+    "RoboMIND",
+    "Humanoid Everyday",
+    "ManipArena",
+    "Shirt-Folding"
+  ],
+  "layouts": [
+    {
+      "layout_id": "robomind_v1__tienkung_gello__30__30",
+      "state_dim": 30,
+      "action_dim": 30,
+      "fps": 30.0,
+      "stream": "A",
+      "hours": 38.4,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-6,8-14",
+        "gripper_idx": [
+          7,
+          15
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "16-29"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "16-29",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robomind_v1__tienkung_xsens__40__40",
+      "state_dim": 40,
+      "action_dim": 40,
+      "fps": 30.0,
+      "stream": "A",
+      "hours": 19.85,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-6,13-19",
+        "gripper_idx": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "26-39"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "26-39",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robomind2__tianyi_mobile__39__39",
+      "state_dim": 39,
+      "action_dim": 39,
+      "fps": 20.0,
+      "stream": "A",
+      "hours": 6.02,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": [
+          14,
+          15
+        ],
+        "drop_idx": [
+          20,
+          21,
+          22,
+          23
+        ],
+        "eef_for_native_head": {
+          "idx": "25-38"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "25-38",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "robomind2__tianyi__30__30",
+      "state_dim": 30,
+      "action_dim": 30,
+      "fps": 50.0,
+      "stream": "A",
+      "hours": 0.77,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": [
+          14,
+          15
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": {
+          "idx": "16-29"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "16-29",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_h1__79__79",
+      "state_dim": 79,
+      "action_dim": 79,
+      "fps": 30.0,
+      "stream": "A",
+      "hours": 12.5,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "26-39",
+        "gripper_idx": [
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64
+        ],
+        "drop_idx": [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          64
+        ],
+        "eef_for_native_head": {
+          "idx": "65-78"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "65-78",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_g1__155__155",
+      "state_dim": 155,
+      "action_dim": 155,
+      "fps": 30.0,
+      "stream": "A",
+      "hours": 11.28,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "26-39",
+        "gripper_idx": [
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68
+        ],
+        "drop_idx": "69-140",
+        "eef_for_native_head": {
+          "idx": "141-154"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "141-154",
+          "format": "xyz+quat_xyzw x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "maniparena__ex001_6r__28__28",
+      "state_dim": 28,
+      "action_dim": 28,
+      "fps": 20.0,
+      "stream": "A",
+      "hours": 0.36,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "14-19,21-26",
+        "gripper_idx": [
+          6,
+          13
+        ],
+        "drop_idx": [
+          20,
+          27
+        ],
+        "eef_for_native_head": {
+          "idx": "0-5,7-12"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "0-5,7-12",
+          "format": "xyz + euler xyz x2 (L, R)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "shirt_folding__openarms_follower__16__16",
+      "state_dim": 16,
+      "action_dim": 16,
+      "fps": 30,
+      "stream": "B",
+      "hours": 0.0043,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-6,8-14",
+        "gripper_idx": [
+          7,
+          15
+        ],
+        "drop_idx": [],
+        "eef_for_native_head": null
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": null
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    }
+  ]
+}

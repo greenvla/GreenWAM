@@ -1,0 +1,148 @@
+{
+  "source": "InternData-A1",
+  "layouts": [
+    {
+      "layout_id": "interndata_a1__arx_lift2__77__70",
+      "state_dim": 77,
+      "action_dim": 70,
+      "fps": 30,
+      "stream": "A",
+      "hours": 105.8,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40
+        ],
+        "gripper_idx": [
+          6,
+          41
+        ],
+        "drop_idx": [
+          73,
+          74,
+          75,
+          76
+        ],
+        "delta_q_cmd_recipe": "Δq_cmd[t] = actions.joint[t] − states.joint[t] ≡ states.joint[t+1] − states.joint[t]. This is a state delta, not a controller command: the source has no command at all.",
+        "eef_for_native_head": {
+          "idx": "14-20, 49-55"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "14-20, 49-55 (ee_to_robot); 7-13, 42-48 (ee_to_armbase); 21-27, 56-62 (tcp_to_armbase); 28-34, 63-69 (tcp_to_robot)",
+          "format": "xyz+quat(w,x,y,z)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "interndata_a1__agilex_split_aloha__77__70",
+      "state_dim": 77,
+      "action_dim": 70,
+      "fps": 30,
+      "stream": "A",
+      "hours": 75.96,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40
+        ],
+        "gripper_idx": [
+          6,
+          41
+        ],
+        "drop_idx": [
+          73,
+          74,
+          75,
+          76
+        ],
+        "delta_q_cmd_recipe": "Δq_cmd[t] = actions.joint[t] − states.joint[t] ≡ states.joint[t+1] − states.joint[t]. This is a state delta, not a controller command: the source has no command at all.",
+        "eef_for_native_head": {
+          "idx": "14-20, 49-55"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "14-20, 49-55 (ee_to_robot); 7-13, 42-48 (ee_to_armbase); 21-27, 56-62 (tcp_to_armbase); 28-34, 63-69 (tcp_to_robot)",
+          "format": "xyz+quat(w,x,y,z)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "interndata_a1__genie1__79__72",
+      "state_dim": 79,
+      "action_dim": 72,
+      "fps": 30,
+      "stream": "A",
+      "hours": 58.15,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42
+        ],
+        "gripper_idx": [
+          7,
+          43
+        ],
+        "drop_idx": [
+          75,
+          76,
+          77,
+          78
+        ],
+        "delta_q_cmd_recipe": "Δq_cmd[t] = actions.joint[t] − states.joint[t] ≡ states.joint[t+1] − states.joint[t]. This is a state delta, not a controller command: the source has no command at all.",
+        "eef_for_native_head": {
+          "idx": "15-21, 51-57"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "15-21, 51-57 (ee_to_robot); 8-14, 44-50 (ee_to_armbase); 22-28, 58-64 (tcp_to_armbase); 29-35, 65-71 (tcp_to_robot)",
+          "format": "xyz+quat(w,x,y,z)"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "source": "Humanoid A v14",
+  "layouts": [
+    {
+      "layout_id": "humanoid_a_v14__humanoid_a__51__52",
+      "state_dim": 51,
+      "action_dim": 52,
+      "fps": 30,
+      "stream": "B",
+      "hours": 202.13,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": {
+          "arms": "13-22",
+          "wrists": "25-28",
+          "hands": "29-40",
+          "formula": "delta_q[t] = action[t] - state[t] = state[t+1] - state[t]"
+        },
+        "gripper_idx": "29-40",
+        "drop_idx": {
+          "legs": "0-11",
+          "waist_yaw": "12",
+          "torso": "41-43",
+          "base_pose": "44",
+          "base_twist": "45-50",
+          "progress": "51",
+          "rc35": "all of observation.robot_command_35x.position"
+        },
+        "eef_for_native_head": {
+          "idx": null
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": null
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    }
+  ]
+}

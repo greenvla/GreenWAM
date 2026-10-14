@@ -1,0 +1,639 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-04T18:09:37.357278+00:00",
+  "note": "Variant 1: dense action_contract_id values index projector-bank rows. Pairs with a defined native action layout are registered; dataset admission remains a separate GreenWAMLayout validation.",
+  "contracts": [
+    {
+      "action_contract": "unverified_joint_delta_000",
+      "action_contract_id": 0,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_eef_delta_001",
+      "action_contract_id": 1,
+      "representation": "eef_delta",
+      "native_width": 20,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_002",
+      "action_contract_id": 2,
+      "representation": "joint_delta",
+      "native_width": 19,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_003",
+      "action_contract_id": 3,
+      "representation": "joint_delta",
+      "native_width": 31,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_eef_delta_004",
+      "action_contract_id": 4,
+      "representation": "eef_delta",
+      "native_width": 20,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_005",
+      "action_contract_id": 5,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_eef_delta_006",
+      "action_contract_id": 6,
+      "representation": "eef_delta",
+      "native_width": 20,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_007",
+      "action_contract_id": 7,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_008",
+      "action_contract_id": 8,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_009",
+      "action_contract_id": 9,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_010",
+      "action_contract_id": 10,
+      "representation": "joint_delta",
+      "native_width": 45,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_011",
+      "action_contract_id": 11,
+      "representation": "joint_delta",
+      "native_width": 28,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_012",
+      "action_contract_id": 12,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_013",
+      "action_contract_id": 13,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_eef_delta_014",
+      "action_contract_id": 14,
+      "representation": "eef_delta",
+      "native_width": 22,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_015",
+      "action_contract_id": 15,
+      "representation": "joint_delta",
+      "native_width": 28,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_016",
+      "action_contract_id": 16,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_017",
+      "action_contract_id": 17,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_018",
+      "action_contract_id": 18,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_019",
+      "action_contract_id": 19,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_020",
+      "action_contract_id": 20,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_021",
+      "action_contract_id": 21,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_022",
+      "action_contract_id": 22,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_023",
+      "action_contract_id": 23,
+      "representation": "joint_delta",
+      "native_width": 36,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_024",
+      "action_contract_id": 24,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_025",
+      "action_contract_id": 25,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_026",
+      "action_contract_id": 26,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_027",
+      "action_contract_id": 27,
+      "representation": "joint_delta",
+      "native_width": 20,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_028",
+      "action_contract_id": 28,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_029",
+      "action_contract_id": 29,
+      "representation": "joint_delta",
+      "native_width": 28,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_030",
+      "action_contract_id": 30,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_031",
+      "action_contract_id": 31,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_032",
+      "action_contract_id": 32,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_033",
+      "action_contract_id": 33,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_034",
+      "action_contract_id": 34,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_035",
+      "action_contract_id": 35,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_036",
+      "action_contract_id": 36,
+      "representation": "joint_delta",
+      "native_width": 16,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_037",
+      "action_contract_id": 37,
+      "representation": "joint_delta",
+      "native_width": 26,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_038",
+      "action_contract_id": 38,
+      "representation": "joint_delta",
+      "native_width": 31,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_039",
+      "action_contract_id": 39,
+      "representation": "joint_delta",
+      "native_width": 28,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_040",
+      "action_contract_id": 40,
+      "representation": "joint_delta",
+      "native_width": 41,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_041",
+      "action_contract_id": 41,
+      "representation": "joint_delta",
+      "native_width": 31,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_042",
+      "action_contract_id": 42,
+      "representation": "joint_delta",
+      "native_width": 41,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_043",
+      "action_contract_id": 43,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    },
+    {
+      "action_contract": "unverified_joint_delta_044",
+      "action_contract_id": 44,
+      "representation": "joint_delta",
+      "native_width": 14,
+      "slots": [],
+      "missing_semantic_names": true,
+      "note": "conservative singleton: ordered semantic slot names are not verified; do not share this projector based on width alone"
+    }
+  ],
+  "bindings": [
+    {
+      "layout_id": "agibotworld2026__g2a__162__162",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_000"
+    },
+    {
+      "layout_id": "behavior1k__r1pro__61__23",
+      "action_space": "eef_delta",
+      "action_contract": "unverified_eef_delta_001"
+    },
+    {
+      "layout_id": "behavior1k__r1pro__61__23",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_002"
+    },
+    {
+      "layout_id": "g1_ikea__unitree_g1_dex1__50__50",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_003"
+    },
+    {
+      "layout_id": "galaxea__r1lite__62__17",
+      "action_space": "eef_delta",
+      "action_contract": "unverified_eef_delta_004"
+    },
+    {
+      "layout_id": "galaxea__r1lite__62__17",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_005"
+    },
+    {
+      "layout_id": "galaxea__r1lite__64__26",
+      "action_space": "eef_delta",
+      "action_contract": "unverified_eef_delta_006"
+    },
+    {
+      "layout_id": "galaxea__r1lite__64__26",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_007"
+    },
+    {
+      "layout_id": "gm100__agibot_g1__43__43",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_008"
+    },
+    {
+      "layout_id": "gm100__agilex_cobot_magic__54__54",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_009"
+    },
+    {
+      "layout_id": "humanoid_a_sim__humanoid_a__51__52",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_010"
+    },
+    {
+      "layout_id": "groot_gr1__gr1t1__44__44",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_011"
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__44__52",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_012"
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__62__1030",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_013"
+    },
+    {
+      "layout_id": "hiw500__unitree_g1__29__23",
+      "action_space": "eef_delta",
+      "action_contract": "unverified_eef_delta_014"
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_g1__155__155",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_015"
+    },
+    {
+      "layout_id": "humanoid_everyday__unitree_h1__79__79",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_016"
+    },
+    {
+      "layout_id": "interndata_a1__agilex_split_aloha__77__70",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_017"
+    },
+    {
+      "layout_id": "interndata_a1__arx_lift2__77__70",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_018"
+    },
+    {
+      "layout_id": "interndata_a1__genie1__79__72",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_019"
+    },
+    {
+      "layout_id": "maniparena__ex001_6r__28__28",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_020"
+    },
+    {
+      "layout_id": "robocoin__agilex_cobot_decoupled_magic_fk_eef_armbase__26__26",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_021"
+    },
+    {
+      "layout_id": "robocoin__alpha_bot_2_fk_eef_armbase__28__28",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_022"
+    },
+    {
+      "layout_id": "robocoin__discover_robotics_aitbot_mmk2__50__50",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_023"
+    },
+    {
+      "layout_id": "robocoin__galaxea_r1_lite_fk_eef_armbase__26__26",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_024"
+    },
+    {
+      "layout_id": "robocoin__leju_robot__132__132",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_025"
+    },
+    {
+      "layout_id": "robocoin__realman_rmc_aidal_fk_eef_armbase__28__28",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_026"
+    },
+    {
+      "layout_id": "robocoin__ruantong_a2d_fk_eef_armbase__41__41",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_027"
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__26__26",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_028"
+    },
+    {
+      "layout_id": "robocoin_g1edu__Unitree_G1edu-u3__28__28",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_029"
+    },
+    {
+      "layout_id": "robomind2__tianyi__30__30",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_030"
+    },
+    {
+      "layout_id": "robomind2__tianyi_mobile__39__39",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_031"
+    },
+    {
+      "layout_id": "robomind_v1__tienkung_gello__30__30",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_032"
+    },
+    {
+      "layout_id": "robomind_v1__tienkung_xsens__40__40",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_033"
+    },
+    {
+      "layout_id": "humanoid_a_v14__humanoid_a__51__52",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_034"
+    },
+    {
+      "layout_id": "shirt_folding__openarms_follower__16__16",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_035"
+    },
+    {
+      "layout_id": "unitree_catalog__unitree_g1_dex1__83__97",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_036"
+    },
+    {
+      "layout_id": "unitree_g1_c__brainco_arm__38__38",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_037"
+    },
+    {
+      "layout_id": "unitree_g1_c__dex1_all__57__57",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_038"
+    },
+    {
+      "layout_id": "unitree_g1_c__dex3__40__40",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_039"
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_brainco__60__60",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_040"
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_dex1__50__50",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_041"
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_inspire__60__60",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_042"
+    },
+    {
+      "layout_id": "dual_arm_b__dual_arm_b__33__34",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_043"
+    },
+    {
+      "layout_id": "dual_arm_b__dual_arm_b__47__48",
+      "action_space": "joint_delta",
+      "action_contract": "unverified_joint_delta_044"
+    }
+  ]
+}

@@ -1,0 +1,402 @@
+{
+  "source": "GreenWAM G1 family: GR00T-Teleop-GR1 + Unitree G1 (collection C) + G1 IKEA + Unitree Catalog",
+  "layouts": [
+    {
+      "layout_id": "groot_gr1__gr1t1__44__44",
+      "state_dim": 44,
+      "action_dim": 44,
+      "fps": 20,
+      "stream": "B",
+      "hours": 87.89,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          41,
+          42
+        ],
+        "gripper_idx": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34
+        ],
+        "drop_idx": [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          43
+        ],
+        "delta_q_cmd_formula": "action[t] − state[t] over the live axes (2x7 arms + 2x6 hands + 2 live waist axes = 28)",
+        "eef_for_native_head": {
+          "idx": null
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": null
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__62__1030",
+      "state_dim": 62,
+      "action_dim": 1030,
+      "fps": 20,
+      "stream": "A",
+      "hours": 0.76,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          964,
+          965,
+          966,
+          967,
+          968,
+          969,
+          970,
+          971,
+          972,
+          973,
+          974,
+          975,
+          976,
+          999,
+          1000,
+          1001,
+          1002,
+          1003,
+          1004,
+          1005,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          1011
+        ],
+        "gripper_idx": [
+          971,
+          972,
+          973,
+          974,
+          975,
+          976,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          1011
+        ],
+        "drop_idx": "0-963, 977-998, 1012-1029",
+        "delta_q_cmd_formula": "action[964:977] − state[0:13] and action[999:1012] − state[31:44] (arms + hands)",
+        "eef_for_native_head": {
+          "format": "xyz+rot6d x2",
+          "idx": "19-27, 50-58"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "state 19-27, 50-58",
+          "format": "xyz+rot6d x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "groot_gr1__gr1t2__44__52",
+      "state_dim": 44,
+      "action_dim": 52,
+      "fps": 20,
+      "stream": "B",
+      "hours": 0.0,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "4-16, 30-42",
+        "drop_idx": "0-3, 17-29, 43-51"
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_inspire__60__60",
+      "state_dim": 60,
+      "action_dim": 60,
+      "fps": 30,
+      "stream": "A",
+      "hours": 12.46,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "31-59",
+        "gripper_idx": "12-23",
+        "drop_idx": "24-30",
+        "delta_q_cmd_formula": "state[t+1][31:60] − state[t][31:60] (== action[t][31:60] − state[t][31:60], since action is a copy)",
+        "eef_for_native_head": {
+          "format": "xyz+euler x2",
+          "idx": "0-11"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "0-11",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_brainco__60__60",
+      "state_dim": 60,
+      "action_dim": 60,
+      "fps": 30,
+      "stream": "A",
+      "hours": 6.55,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "31-59",
+        "gripper_idx": "12-23",
+        "drop_idx": "24-30",
+        "eef_for_native_head": {
+          "format": "xyz+euler x2",
+          "idx": "0-11"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "0-11",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__brainco_arm__38__38",
+      "state_dim": 38,
+      "action_dim": 38,
+      "fps": 30,
+      "stream": "A",
+      "hours": 6.51,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": "14-25",
+        "drop_idx": null,
+        "eef_for_native_head": {
+          "format": "xyz+euler x2",
+          "idx": "26-37"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "26-37",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__dex3__40__40",
+      "state_dim": 40,
+      "action_dim": 40,
+      "fps": 30,
+      "stream": "A",
+      "hours": 6.34,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "0-13",
+        "gripper_idx": "14-27",
+        "drop_idx": null,
+        "eef_for_native_head": {
+          "format": "xyz+euler x2",
+          "idx": "28-39"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "28-39",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__wbt_dex1__50__50",
+      "state_dim": 50,
+      "action_dim": 50,
+      "fps": 30,
+      "stream": "A",
+      "hours": 0.88,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "21-49",
+        "gripper_idx": "12-13",
+        "drop_idx": "14-20",
+        "eef_for_native_head": {
+          "format": "xyz+euler x2",
+          "idx": "0-11"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "0-11",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "unitree_g1_c__dex1_all__57__57",
+      "state_dim": 57,
+      "action_dim": 57,
+      "fps": 30,
+      "stream": "A",
+      "hours": 0.01,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "28-56",
+        "gripper_idx": "14-15",
+        "drop_idx": "0-13",
+        "eef_for_native_head": {
+          "idx": "16-27"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "16-27",
+          "format": "xyz+euler x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": true
+      }
+    },
+    {
+      "layout_id": "g1_ikea__unitree_g1_dex1__50__50",
+      "state_dim": 50,
+      "action_dim": 50,
+      "fps": 30,
+      "stream": "A",
+      "hours": 9.83,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": "21-49",
+        "gripper_idx": [
+          12,
+          13
+        ],
+        "drop_idx": "14-20",
+        "delta_q_cmd_formula": "action.robot_q_desired[7:36] − observation.state.robot_q_current[7:36] (29 joints)",
+        "eef_for_native_head": {
+          "format": "xyz+euler(rpy) x2",
+          "idx": "0-11"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "0-11",
+          "format": "xyz+euler(rpy) x2"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    },
+    {
+      "layout_id": "unitree_catalog__unitree_g1_dex1__83__97",
+      "state_dim": 83,
+      "action_dim": 97,
+      "fps": 30,
+      "stream": "A",
+      "hours": 11.92,
+      "greenwam_mapping": {
+        "delta_q_cmd_idx": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "gripper_idx": [
+          14,
+          15
+        ],
+        "drop_idx": "16-30, 31-37, 42-53, 54-57, 70-81, 94-96",
+        "delta_q_cmd_formula": "action[0:14] − state[0:14] (14 arm axes); the lower body is not part of the command because action.lower_body is a bitwise copy of state.lower_body at lag 0",
+        "eef_for_native_head": {
+          "format": "xyz+euler(rpy) x2",
+          "idx": "43-54"
+        }
+      },
+      "blocks": {
+        "eef_pose": {
+          "idx": "43-54 (base frame), 67-78 (torso frame)",
+          "format": "xyz+euler(rpy) x2 in each frame"
+        }
+      },
+      "action_semantics": {
+        "pseudo_action": false
+      }
+    }
+  ]
+}
