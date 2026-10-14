@@ -3,7 +3,15 @@
 
 """User-facing torch.compile knobs for VFM and VLM training paths."""
 
+from typing import Literal
+
 import attrs
+
+ARPostSaturationMode = Literal[
+    "default",
+    "static-compile",
+    "cuda-graph",
+]
 
 
 @attrs.define(slots=False)
@@ -30,6 +38,23 @@ class CompileConfig:
 
     # Whether to use CUDA graphs for faster inference. This option does not work during training.
     use_cuda_graphs: bool = False
+
+    # AR-inference-specific behavior once the rolling KV window saturates.
+    # "default" uses the global compile settings for the entire generation.
+    # "static-compile" keeps the normal pre-saturation path, then uses dedicated
+    # static-compiled decoder layers. "cuda-graph" keeps pre-saturation eager,
+    # then captures coarse denoise and KV-refresh graphs; it requires both
+    # ``enabled`` and ``use_cuda_graphs`` to be False.
+    ar_post_saturation_mode: ARPostSaturationMode = attrs.field(
+        default="default",
+        validator=attrs.validators.in_(
+            {
+                "default",
+                "static-compile",
+                "cuda-graph",
+            }
+        ),
+    )
 
     # Enable autotuning for pointwise/reduction Triton kernels (e.g. RMSNorm).
     # Explores 6 candidate configs instead of the default 1, improving kernel performance

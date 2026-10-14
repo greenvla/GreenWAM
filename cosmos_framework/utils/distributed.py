@@ -7,8 +7,14 @@ import collections
 import collections.abc
 import ctypes
 import functools
+import math
 import os
+import socket
+import sys
+import threading
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Container, Optional
 
@@ -30,8 +36,34 @@ if TYPE_CHECKING:
     from cosmos_framework.utils.config import DDPConfig
 
 
-def init() -> int | None:
-    """Initialize distributed training."""
+def _set_cpu_affinity(requested):
+    """NVML describes host CPUs; a container may permit only a disjoint set."""
+    try:
+        allowed = os.sched_getaffinity(0)
+        selected = set(requested).intersection(allowed)
+        if selected:
+            os.sched_setaffinity(0, selected)
+        else:
+            log.warning(f"GPU CPU affinity has no CPUs allowed by this container; retaining {sorted(allowed)}")
+    except OSError as error:
+        # NUMA affinity is an optimization, not a distributed-training prerequisite.
+        log.warning(f"CPU affinity unavailable; retaining current affinity: {error}")
+
+
+def init(store: dist.Store | None = None, backend: str | None = None) -> int | None:
+    """Initialize distributed training.
+
+    Args:
+        store: Optional pre-built rendezvous store. When given, it is used instead of ``env://``
+            rendezvous, so no ``MASTER_PORT`` is bound. Used by the background checkpoint process,
+            whose store adopts a socket its parent reserved (see
+            :mod:`cosmos_framework.checkpoint.background_store`). ``RANK`` and ``WORLD_SIZE`` must be
+            set, as they are for env:// rendezvous.
+        backend: Optional backend override. Defaults to nccl on CUDA. The background checkpoint
+            process passes "gloo": it coordinates over CPU-resident state dicts, which NCCL cannot
+            synchronize, and a second NCCL group per rank would consume GPU memory alongside the
+            training group's communicators.
+    """
     if dist.is_initialized():
         return torch.cuda.current_device()
 
@@ -40,7 +72,7 @@ def init() -> int | None:
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     try:
         device = Device(local_rank)
-        os.sched_setaffinity(0, device.get_cpu_affinity())
+        _set_cpu_affinity(device.get_cpu_affinity())
     except pynvml.NVMLError as e:
         log.warning(f"Failed to set device affinity: {e}")
     # Set up distributed communication. CPU checkpoint conversion needs Gloo
@@ -53,8 +85,27 @@ def init() -> int | None:
         timeout_seconds = os.getenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", 1800)
         # Convert the timeout to an integer (if it isn't already) and then to a timedelta
         timeout_timedelta = timedelta(seconds=int(timeout_seconds))
-        backend = "nccl" if os.environ.get("COSMOS_DEVICE", "cuda").lower() == "cuda" else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://", timeout=timeout_timedelta)
+        subgroup_timeout_seconds = os.environ.get("COSMOS_NCCL_SUBGROUP_TIMEOUT_SEC")
+        if subgroup_timeout_seconds is not None:
+            # DeviceMesh creates NCCL subgroups without an explicit timeout, so
+            # PyTorch otherwise uses its shorter 10-minute NCCL default.
+            dist.distributed_c10d.default_pg_nccl_timeout = timedelta(seconds=int(subgroup_timeout_seconds))
+            log.info(
+                f"Set default NCCL subgroup timeout to {subgroup_timeout_seconds} seconds",
+                rank0_only=False,
+            )
+        if backend is None:
+            backend = "nccl" if os.environ.get("COSMOS_DEVICE", "cuda").lower() == "cuda" else "gloo"
+        if store is not None:
+            dist.init_process_group(
+                backend=backend,
+                store=store,
+                rank=int(os.environ["RANK"]),
+                world_size=int(os.environ["WORLD_SIZE"]),
+                timeout=timeout_timedelta,
+            )
+        else:
+            dist.init_process_group(backend=backend, init_method="env://", timeout=timeout_timedelta)
         log.critical(
             f"Initialized distributed training with local rank {local_rank} using {backend} with timeout {timeout_seconds}",
             rank0_only=False,
@@ -141,6 +192,122 @@ def barrier() -> None:
     """Barrier for all GPUs."""
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+WORLD_COMM_TIMEOUT_ENV_VAR = "COSMOS_WORLD_COMM_TIMEOUT_SEC"
+# Comfortably above a legitimate large-scale communicator build, and well below both the 1800s NCCL
+# watchdog and the cluster idle-GPU reaper, so a stuck startup requeues instead of being reclaimed.
+DEFAULT_WORLD_COMM_TIMEOUT_SEC = 600.0
+WORLD_COMM_TIMEOUT_EXIT_CODE = 93
+# Grace period between the deadline expiring and the abort, so a build that lands in the same instant
+# is not mistaken for a stall. Costs nothing on a real stall and never on a healthy build.
+WORLD_COMM_ABORT_GRACE_SEC = 5.0
+
+
+def get_world_comm_timeout_sec() -> float:
+    """Return the world-communicator deadline in seconds, or 0 to wait indefinitely."""
+    raw = os.environ.get(WORLD_COMM_TIMEOUT_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_WORLD_COMM_TIMEOUT_SEC
+    try:
+        parsed = float(raw)
+    except ValueError:
+        log.warning(f"Ignoring non-numeric {WORLD_COMM_TIMEOUT_ENV_VAR}={raw!r}")
+        return DEFAULT_WORLD_COMM_TIMEOUT_SEC
+    if not math.isfinite(parsed):
+        # float() accepts "nan" and "inf", and both defeat the deadline they are supposed to set: nan
+        # compares False against everything, so it slips through the `timeout_sec > 0` guard and
+        # silently disarms the watchdog, while inf makes Event.wait raise OverflowError inside the
+        # watchdog thread. Either way the stall this exists to bound goes unbounded.
+        log.warning(f"Ignoring non-finite {WORLD_COMM_TIMEOUT_ENV_VAR}={raw!r}")
+        return DEFAULT_WORLD_COMM_TIMEOUT_SEC
+    if parsed < 0:
+        # Clamping to 0 here would read a negative as the documented request to wait indefinitely,
+        # so a typo like -60 would silently disarm the watchdog. Only an explicit 0 should do that.
+        log.warning(f"Ignoring negative {WORLD_COMM_TIMEOUT_ENV_VAR}={raw!r} (set 0 to wait indefinitely)")
+        return DEFAULT_WORLD_COMM_TIMEOUT_SEC
+    return parsed
+
+
+def _abort_on_world_comm_timeout(done: threading.Event, timeout_sec: float, rank: int, world_size: int) -> None:
+    """Log and kill the process if the world communicator is not up before the deadline."""
+    if done.wait(timeout_sec):
+        return
+    # The builder only signals once its collective has returned, so a build finishing right as the
+    # deadline expires would otherwise be killed as a stall. Give it a moment to say it is done. A
+    # real stall spends this grace period exactly as stuck as it was before.
+    if done.wait(WORLD_COMM_ABORT_GRACE_SEC):
+        log.warning(
+            f"[RANK {rank}] The world communicator took nearly the full {timeout_sec:.0f}s deadline "
+            f"to come up. Treating it as healthy, but this rank was within "
+            f"{WORLD_COMM_ABORT_GRACE_SEC:.0f}s of aborting the job.",
+            rank0_only=False,
+        )
+        return
+    log.critical(
+        f"[RANK {rank}] The {world_size}-rank world NCCL communicator did not come up within "
+        f"{timeout_sec:.0f}s on {socket.gethostname()}. This is a cross-domain fabric or bootstrap "
+        f"fault, not a model or config error. Aborting so the job requeues instead of idling. "
+        f"Re-run with NCCL_DEBUG=INFO and NCCL_DEBUG_SUBSYS=INIT,NET to identify the stuck peer, or "
+        f"raise {WORLD_COMM_TIMEOUT_ENV_VAR} if this job legitimately needs longer.",
+        rank0_only=False,
+    )
+    sys.stderr.flush()
+    sys.stdout.flush()
+    # ncclCommInitRank blocks inside a C call, so the stuck thread cannot be unwound from Python and
+    # a normal exit would just join it. Leave immediately instead.
+    os._exit(WORLD_COMM_TIMEOUT_EXIT_CODE)
+
+
+def ensure_world_communicator(timeout_sec: float | None = None) -> None:
+    """Build the world-size communicator up front, under a deadline and with log lines around it.
+
+    PyTorch creates NCCL communicators lazily, so the world communicator is built by whichever
+    collective happens to run first. That makes a cross-domain fabric fault surface as an unattributed
+    hang inside unrelated code, with no log line naming what is stuck. Doing the build here gives it
+    a name, a bounded duration, and an actionable error.
+
+    The deadline needs a watchdog thread rather than a signal or a process-group timeout: a stall
+    inside ``ncclCommInitRank`` never enqueues work, so PyTorch's collective watchdog has nothing to
+    time out on, and the calling thread is parked in a C call where Python exceptions cannot land.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world_size = get_world_size()
+    if world_size < 2:
+        return
+    if timeout_sec is None:
+        timeout_sec = get_world_comm_timeout_sec()
+
+    rank = get_rank()
+    on_cuda = dist.get_backend() == "nccl"
+    log.info(
+        f"Building the {world_size}-rank world communicator (deadline {timeout_sec:.0f}s)",
+        rank0_only=False,
+    )
+    done = threading.Event()
+    if timeout_sec > 0:
+        threading.Thread(
+            target=_abort_on_world_comm_timeout,
+            args=(done, timeout_sec, rank, world_size),
+            name="world-comm-watchdog",
+            daemon=True,
+        ).start()
+
+    start = time.monotonic()
+    try:
+        probe = torch.ones(1, device="cuda" if on_cuda else "cpu", dtype=torch.float32)
+        dist.all_reduce(probe)
+        if on_cuda:
+            torch.cuda.synchronize()
+    finally:
+        done.set()
+    if probe.item() != float(world_size):
+        raise RuntimeError(
+            f"World communicator check summed to {probe.item()} across {world_size} ranks; "
+            "the world process group is not consistent."
+        )
+    log.info(f"World communicator ready in {time.monotonic() - start:.2f} s")
 
 
 def rank0_first(func: Callable) -> Callable:
@@ -239,19 +406,56 @@ def ddp_sync_grad(model, enabled):
         else gradients will still be synchronized.
     """
     assert isinstance(model, torch.nn.Module)
-    if isinstance(model, DistributedDataParallel):
-        old_require_backward_grad_sync = model.require_backward_grad_sync
-        if model.static_graph and model.require_backward_grad_sync != enabled:
-            if model.show_sync_grad_static_graph_warning:
-                log.warning("DDP static_graph=True is incompatible with sync_grad(). Performance will be reduced.")
-                model.show_sync_grad_static_graph_warning = False
-        else:
-            model.require_backward_grad_sync = enabled
+    ddp_mutated = False
+    old_require_backward_grad_sync = None
+    fsdp_prev: list = []  # (FSDPModule, previous all_reduce_grads) for exactly the modules we mutated
     try:
+        if isinstance(model, DistributedDataParallel):
+            old_require_backward_grad_sync = model.require_backward_grad_sync
+            if model.static_graph and model.require_backward_grad_sync != enabled:
+                if model.show_sync_grad_static_graph_warning:
+                    log.warning("DDP static_graph=True is incompatible with sync_grad(). Performance will be reduced.")
+                    model.show_sync_grad_static_graph_warning = False
+            else:
+                model.require_backward_grad_sync = enabled
+                ddp_mutated = True
+        else:
+            # FSDP2 (fully_shard) branch. Without this, gradient accumulation
+            # reduces gradients on EVERY micro-step and saves no communication
+            # (measured: accum=4 step = 4x the accum=1 step on Ethernet HSDP).
+            # We defer only the cross-replica all-reduce to the boundary
+            # micro-step. The intra-node reduce-scatter still runs every
+            # micro-step, so gradients stay sharded and VRAM does not grow
+            # (set_requires_gradient_sync(False) would keep gradients
+            # unsharded: +stored-grad-bytes per rank).
+            # Every non-DDP model takes this branch, including single-process
+            # runs: skip early when there is nothing to sync, and before the
+            # fsdp import, which fails on builds without distributed.
+            if not dist.is_available() or not dist.is_initialized():
+                yield
+                return
+            from torch.distributed.fsdp import FSDPModule
+
+            for m in model.modules():
+                if not isinstance(m, FSDPModule):
+                    continue
+                # Mirror of set_requires_all_reduce(recurse=False): it writes
+                # state._fsdp_param_group.all_reduce_grads when the group is
+                # truthy, so that is the previous state to capture. Recording
+                # (module, prev) as we mutate keeps the finally-block exact
+                # even if this loop raises midway.
+                fsdp_param_group = m._get_fsdp_state()._fsdp_param_group
+                if not fsdp_param_group:
+                    continue
+                prev = fsdp_param_group.all_reduce_grads
+                m.set_requires_all_reduce(enabled, recurse=False)
+                fsdp_prev.append((m, prev))
         yield
     finally:
-        if isinstance(model, DistributedDataParallel):
+        if ddp_mutated:
             model.require_backward_grad_sync = old_require_backward_grad_sync
+        for m, prev in fsdp_prev:
+            m.set_requires_all_reduce(prev, recurse=False)
 
 
 def collate_batches(data_batches: list[dict[str, torch.Tensor]]) -> torch.Tensor | dict[str, torch.Tensor]:
@@ -355,6 +559,73 @@ def dist_reduce_tensor(tensor, rank=0, reduce="mean"):
     return tensor
 
 
+def _verify_param_dtype_across_processes(
+    process_group: dist.ProcessGroup,
+    parameters: list[torch.Tensor],
+) -> None:
+    """Verify that all ranks agree on parameter dtypes to prevent NCCL deadlocks.
+
+    ``_sync_module_states`` buckets tensors by dtype before broadcasting.  If ranks
+    disagree on dtypes (e.g. rank-0 loaded a bf16 checkpoint while others hold fp32
+    meta-initialised tensors), each rank builds a different number of broadcast
+    buckets, causing an unrecoverable NCCL busy-wait deadlock.
+    """
+    # Encode each parameter's dtype as its torch enum value and pack into a
+    # single int64 tensor so we only need one all-reduce.
+    local_dtypes = torch.tensor(
+        [_dtype_to_int(p.dtype) for p in parameters],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+    # Gather dtype vectors from every rank.
+    world_size = dist.get_world_size(process_group)
+    gathered = [torch.zeros_like(local_dtypes) for _ in range(dist.get_world_size(process_group))]
+    dist.all_gather(gathered, local_dtypes, group=process_group)
+
+    rank = dist.get_rank(process_group)
+    for other_rank, other_dtypes in enumerate(gathered):
+        if torch.equal(local_dtypes, other_dtypes):
+            continue
+        mismatched = (local_dtypes != other_dtypes).nonzero(as_tuple=True)[0]
+        details = ", ".join(
+            f"param[{int(idx)}]: rank {rank}={_int_to_dtype(int(local_dtypes[idx]))} "
+            f"vs rank {other_rank}={_int_to_dtype(int(other_dtypes[idx]))}"
+            for idx in mismatched[:5]
+        )
+        raise RuntimeError(
+            f"Parameter dtype mismatch across ranks (showing up to 5): {details}. "
+            f"This will cause _broadcast_coalesced to build different buckets per rank "
+            f"and deadlock NCCL. Ensure all ranks cast the model to the same dtype before "
+            f"calling sync_model_states()."
+        )
+
+
+_DTYPE_TO_INT: dict[torch.dtype, int] = {
+    torch.float16: 0,
+    torch.bfloat16: 1,
+    torch.float32: 2,
+    torch.float64: 3,
+    torch.int8: 4,
+    torch.int16: 5,
+    torch.int32: 6,
+    torch.int64: 7,
+    torch.uint8: 8,
+    torch.bool: 9,
+}
+_INT_TO_DTYPE: dict[int, torch.dtype] = {v: k for k, v in _DTYPE_TO_INT.items()}
+
+
+def _dtype_to_int(dtype: torch.dtype) -> int:
+    if dtype in _DTYPE_TO_INT:
+        return _DTYPE_TO_INT[dtype]
+    return hash(dtype) % (2**31)
+
+
+def _int_to_dtype(val: int) -> torch.dtype | str:
+    return _INT_TO_DTYPE.get(val, f"unknown({val})")
+
+
 def sync_model_states(
     model: torch.nn.Module,
     process_group: Optional[dist.ProcessGroup] = None,
@@ -439,6 +710,7 @@ def sync_model_states(
         return
 
     _verify_param_shape_across_processes(process_group, parameters)
+    _verify_param_dtype_across_processes(process_group, parameters)
 
     _sync_module_states(
         module=model,
@@ -473,6 +745,227 @@ def broadcast_object_list(object_list, *args, **kwargs):
         return None
     else:
         dist.broadcast_object_list(object_list, *args, **kwargs)
+
+
+@dataclass(frozen=True)
+class _TensorBroadcastMetadata:
+    """Small placeholder used while broadcasting a nested object containing tensors."""
+
+    tensor_index: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def _extract_tensor_leaves(value: Any, min_tensor_bytes: int) -> tuple[Any, list[torch.Tensor]]:
+    """Replace large or CUDA tensor leaves while preserving the surrounding containers."""
+    tensor_leaves: list[torch.Tensor] = []
+    tensor_metadata_by_id: dict[int, _TensorBroadcastMetadata] = {}
+    seen_container_ids: set[int] = set()
+
+    def _require_unique_container(current_value: Any) -> None:
+        object_id = id(current_value)
+        if object_id in seen_container_ids:
+            raise ValueError(
+                "Optimized object broadcast requires an acyclic tree without shared container references; "
+                f"encountered {type(current_value).__name__} more than once."
+            )
+        seen_container_ids.add(object_id)
+
+    def _extract(current_value: Any) -> Any:
+        if isinstance(current_value, torch.Tensor):
+            tensor_bytes = current_value.numel() * current_value.element_size()
+            # Pickling a CUDA tensor preserves the source device index, so a tensor
+            # broadcast from cuda:0 would remain on cuda:0 in a cuda:1 process.
+            # Always use the direct path so receivers rebuild it on their current device.
+            if tensor_bytes < min_tensor_bytes and current_value.device.type != "cuda":
+                return current_value
+            if current_value.layout != torch.strided:
+                log.warning(f"Only strided tensors can be broadcast; skip layout={current_value.layout}.")
+                return current_value
+            if type(current_value) is not torch.Tensor:
+                raise TypeError(
+                    "Optimized object broadcast only supports plain torch.Tensor leaves, "
+                    f"got {type(current_value).__name__}."
+                )
+            object_id = id(current_value)
+            existing_metadata = tensor_metadata_by_id.get(object_id)
+            if existing_metadata is not None:
+                return existing_metadata
+            metadata = _TensorBroadcastMetadata(
+                tensor_index=len(tensor_leaves),
+                shape=tuple(current_value.shape),
+                dtype=current_value.dtype,
+            )
+            tensor_metadata_by_id[object_id] = metadata
+            tensor_leaves.append(current_value)
+            return metadata
+        if isinstance(current_value, dict):
+            if type(current_value) is not dict:
+                raise TypeError(
+                    "Optimized object broadcast only supports plain dict containers, "
+                    f"got {type(current_value).__name__}."
+                )
+            _require_unique_container(current_value)
+            return {key: _extract(item) for key, item in current_value.items()}
+        if isinstance(current_value, list):
+            if type(current_value) is not list:
+                raise TypeError(
+                    "Optimized object broadcast only supports plain list containers, "
+                    f"got {type(current_value).__name__}."
+                )
+            _require_unique_container(current_value)
+            return [_extract(item) for item in current_value]
+        if isinstance(current_value, tuple):
+            is_namedtuple = hasattr(current_value, "_fields")
+            if type(current_value) is not tuple and not is_namedtuple:
+                raise TypeError(
+                    "Optimized object broadcast only supports plain tuple or namedtuple containers, "
+                    f"got {type(current_value).__name__}."
+                )
+            _require_unique_container(current_value)
+            extracted_items = tuple(_extract(item) for item in current_value)
+            # Namedtuples are tuple subclasses whose constructors expect each field as a positional argument.
+            if is_namedtuple:
+                return type(current_value)(*extracted_items)
+            return extracted_items
+        return current_value
+
+    return _extract(value), tensor_leaves
+
+
+def broadcast_object_list_optimized(
+    object_list: list[Any],
+    src: int | None = None,
+    group: dist.ProcessGroup | None = None,
+    device: torch.device | None = None,
+    group_src: int | None = None,
+    *,
+    min_tensor_bytes: int = sys.maxsize,
+) -> None:
+    """Broadcast objects in place, sending sufficiently large tensor leaves directly.
+
+    This is a signature-compatible alternative to :func:`torch.distributed.broadcast_object_list`.
+    The source broadcasts an object-list skeleton first. CUDA tensor leaves and
+    tensor leaves at least ``min_tensor_bytes`` bytes large are replaced by
+    metadata, broadcast directly, and inserted back into the skeleton in traversal
+    order. Smaller non-CUDA tensors remain in the object payload. NCCL groups place
+    directly broadcast tensors on ``device`` or the current CUDA device; other
+    backends use CPU tensors. The default ``sys.maxsize`` threshold calls the
+    original PyTorch collective directly.
+
+    Direct tensor extraction requires an acyclic tree of plain ``dict``, ``list``,
+    and ``tuple`` containers; namedtuples are also supported. Repeated references
+    to the same tensor are broadcast once and preserved in the rebuilt object
+    graph. The source raises before entering the collective when it encounters a
+    container subclass, a tensor subclass selected for direct broadcast, a shared
+    container reference, or a cycle. Use the default threshold for arbitrary
+    picklable object graphs.
+
+    Args:
+        object_list: List of objects to broadcast. Updated in place on every participating rank.
+        src: Global source rank. Mutually exclusive with ``group_src``. Defaults to rank 0 when both are omitted.
+        group: Process group whose ranks receive the value.
+        device: Device used by the object collective and by direct NCCL tensor broadcasts.
+        group_src: Source rank relative to ``group``. Mutually exclusive with ``src``.
+        min_tensor_bytes: Minimum tensor payload size to broadcast directly.
+    """
+    if min_tensor_bytes < 0:
+        raise ValueError(f"min_tensor_bytes must be non-negative, got {min_tensor_bytes}.")
+    if min_tensor_bytes == sys.maxsize or group == dist.GroupMember.NON_GROUP_MEMBER:
+        dist.broadcast_object_list(
+            object_list,
+            src=src,
+            group=group,
+            device=device,
+            group_src=group_src,
+        )
+        return
+    if src is None and group_src is None:
+        src = 0
+    elif src is not None and group_src is not None:
+        raise ValueError("src and group_src cannot both be specified.")
+
+    is_source = dist.get_rank() == src if src is not None else dist.get_rank(group) == group_src
+    if is_source:
+        skeleton, tensor_leaves = _extract_tensor_leaves(object_list, min_tensor_bytes)
+    else:
+        skeleton, tensor_leaves = None, []
+
+    skeleton_box = [skeleton]
+    dist.broadcast_object_list(
+        skeleton_box,
+        src=src,
+        group=group,
+        device=device,
+        group_src=group_src,
+    )
+    skeleton = skeleton_box[0]
+
+    backend = dist.get_backend(group)
+    if backend == dist.Backend.NCCL:
+        collective_device = device or torch.device("cuda", torch.cuda.current_device())
+    else:
+        collective_device = torch.device("cpu")
+    rebuilt_tensors: list[torch.Tensor] = []
+
+    def _rebuild(current_value: Any) -> Any:
+        if isinstance(current_value, _TensorBroadcastMetadata):
+            tensor_index = current_value.tensor_index
+            if 0 <= tensor_index < len(rebuilt_tensors):
+                return rebuilt_tensors[tensor_index]
+            if tensor_index != len(rebuilt_tensors):
+                raise RuntimeError(
+                    "Broadcast object-list skeleton contains an out-of-order tensor index: "
+                    f"expected {len(rebuilt_tensors)}, got {tensor_index}."
+                )
+            if is_source:
+                if tensor_index >= len(tensor_leaves):
+                    raise RuntimeError(
+                        f"Broadcast object-list skeleton references missing source tensor index {tensor_index}."
+                    )
+                source_tensor = tensor_leaves[tensor_index]  # [*shape]
+                if (
+                    source_tensor.device.type == "cuda"
+                    and collective_device.type == "cuda"
+                    and source_tensor.device != collective_device
+                ):
+                    log.warning(
+                        "Direct tensor broadcast moves a tensor between CUDA devices: "
+                        f"index={tensor_index}, source_device={source_tensor.device}, "
+                        f"collective_device={collective_device}, src={src}",
+                        rank0_only=False,
+                    )
+                tensor = source_tensor.to(device=collective_device)  # [*shape]
+                tensor = tensor.contiguous()  # [*shape]
+            else:
+                tensor = torch.empty(  # [*shape]
+                    current_value.shape,
+                    dtype=current_value.dtype,
+                    device=collective_device,
+                )
+            dist.broadcast(tensor, src=src, group=group, group_src=group_src)
+            rebuilt_tensors.append(tensor)
+            return tensor
+        if isinstance(current_value, dict):
+            return {key: _rebuild(item) for key, item in current_value.items()}
+        if isinstance(current_value, list):
+            return [_rebuild(item) for item in current_value]
+        if isinstance(current_value, tuple):
+            rebuilt_items = tuple(_rebuild(item) for item in current_value)
+            # Namedtuples are tuple subclasses whose constructors expect each field as a positional argument.
+            if hasattr(current_value, "_fields"):
+                return type(current_value)(*rebuilt_items)
+            return rebuilt_items
+        return current_value
+
+    rebuilt_object_list = _rebuild(skeleton)
+    if is_source and len(rebuilt_tensors) != len(tensor_leaves):
+        raise RuntimeError(
+            f"Broadcast rebuilt {len(rebuilt_tensors)} tensors but source provided {len(tensor_leaves)}."
+        )
+    if not isinstance(rebuilt_object_list, list):
+        raise RuntimeError(f"Broadcast object-list skeleton must be a list, got {type(rebuilt_object_list).__name__}.")
+    object_list[:] = rebuilt_object_list
 
 
 def destroy_process_group():

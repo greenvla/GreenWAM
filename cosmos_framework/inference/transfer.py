@@ -265,6 +265,8 @@ def _build_no_control_inference_state(
         raw_state_action=gen_data_clean.raw_state_action,
         x0_tokens_action=gen_data_clean.x0_tokens_action,
         action_domain_id=gen_data_clean.action_domain_id,
+        action_contract_id=gen_data_clean.action_contract_id,
+        action_layout_id=gen_data_clean.action_layout_id,
         fps_action=gen_data_clean.fps_action,
         raw_action_dim=gen_data_clean.raw_action_dim,
         raw_state_sound=gen_data_clean.raw_state_sound,
@@ -354,6 +356,7 @@ def build_control_cfg_postprocess(
                 sequence_plans=sp_nc,
                 gen_data_clean=gdc_nc,
                 skip_text_tokens=False,
+                has_noisy_actions=False,  # control-CFG is video-only (action/sound rejected above)
             )
 
             # Mix only the suffix (target vision). The control-token portion

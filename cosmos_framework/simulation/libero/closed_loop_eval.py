@@ -55,8 +55,8 @@ from cosmos_framework.data.generator.action.libero_pose_utils import (
     libero_rotation_format,
     libero_rotation_space_from_action_dim,
 )
-from cosmos_framework.data.generator.action.pose_utils import convert_rotation
-from cosmos_framework.data.generator.action.viewpoint_utils import DEFAULT_VIEWPOINT_TEMPLATES
+from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
+from cosmos_framework.data.generator.action.utils.viewpoint_utils import DEFAULT_VIEWPOINT_TEMPLATES
 
 benchmark: Any
 get_libero_path: Any
@@ -149,6 +149,8 @@ class ActionEnvironmentClient:
         self.prompt = prompt
         self.image_size = image_size
         self.timeout = timeout
+        # Policies that also take the proprioceptive state (--send_state, see _libero_state).
+        self.send_state = False
 
     def check_health(self) -> bool:
         """Check if the model server is healthy."""
@@ -231,7 +233,7 @@ class ActionEnvironmentClient:
         resized = [self.resize_image(img) for img in images]
         return np.concatenate(resized, axis=1)
 
-    def predict(self, observation: np.ndarray | list[np.ndarray]) -> dict[str, Any]:
+    def predict(self, observation: np.ndarray | list[np.ndarray], state: np.ndarray | None = None) -> dict[str, Any]:
         """Send observation(s) to model server and get predicted actions.
 
         Args:
@@ -252,6 +254,8 @@ class ActionEnvironmentClient:
             "domain_name": self.domain_name,
             "image_size": self.image_size,
         }
+        if state is not None:
+            payload["state"] = [float(x) for x in state]
 
         resp = requests.post(
             f"{self.server_url}/predict",
@@ -266,21 +270,24 @@ class ActionEnvironmentClient:
             raise RuntimeError(f"Model server error: {result['error']}")
         return result
 
-    def predict_batch(self, observations: list[list[np.ndarray]]) -> list[list[list[float]]]:
+    def predict_batch(
+        self, observations: list[list[np.ndarray]], states: list[np.ndarray] | None = None
+    ) -> list[list[list[float]]]:
         """Batched inference: a list of per-env multi-view observations -> ONE
         POST /predict_batch -> a list of action chunks (one per env). Used by the
         vectorized eval so N parallel envs share a single diffusion forward."""
         items = []
-        for obs_imgs in observations:
+        for k, obs_imgs in enumerate(observations):
             concat = self.concatenate_images(obs_imgs) if len(obs_imgs) > 1 else self.resize_image(obs_imgs[0])
-            items.append(
-                {
-                    "image": self.encode_image_raw(concat),
-                    "prompt": self.prompt,
-                    "domain_name": self.domain_name,
-                    "image_size": self.image_size,
-                }
-            )
+            item = {
+                "image": self.encode_image_raw(concat),
+                "prompt": self.prompt,
+                "domain_name": self.domain_name,
+                "image_size": self.image_size,
+            }
+            if states is not None:
+                item["state"] = [float(x) for x in states[k]]
+            items.append(item)
         resp = requests.post(
             f"{self.server_url}/predict_batch",
             json={"items": items},
@@ -539,6 +546,27 @@ def _infer_rotation_space(action_dim: int, rotation_space: str) -> str:
     return libero_rotation_space_from_action_dim(action_dim)
 
 
+def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
+    """robosuite quaternion (x, y, z, w) -> axis-angle (robosuite ``quat2axisangle``, as openpi's LIBERO example)."""
+    quat = np.asarray(quat, dtype=np.float64).copy()
+    quat[3] = np.clip(quat[3], -1.0, 1.0)
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if np.isclose(den, 0.0):
+        return np.zeros(3, dtype=np.float32)
+    return (quat[:3] * 2.0 * np.arccos(quat[3]) / den).astype(np.float32)
+
+
+def _libero_state(obs: dict[str, Any]) -> np.ndarray:
+    """[8] EEF position, EEF axis-angle and the two finger joints: ``observation.state`` of LIBERO_LeRobot_v3."""
+    return np.concatenate(
+        [
+            np.asarray(obs["robot0_eef_pos"], dtype=np.float32),
+            _quat2axisangle(obs["robot0_eef_quat"]),
+            np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32),
+        ]
+    )
+
+
 def _obs_to_pose(obs: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     position = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
     quat = np.asarray(obs["robot0_eef_quat"], dtype=np.float32)
@@ -678,7 +706,7 @@ def _run_episode(
                     flip_images=flip_images,
                     rotate_180=rotate_180,
                 )
-                result = client.predict(observation_imgs)
+                result = client.predict(observation_imgs, _libero_state(obs) if client.send_state else None)
             else:
                 observation_img = _get_libero_image(
                     obs,
@@ -686,7 +714,7 @@ def _run_episode(
                     flip_images=flip_images,
                     rotate_180=rotate_180,
                 )
-                result = client.predict(observation_img)
+                result = client.predict(observation_img, _libero_state(obs) if client.send_state else None)
             actions = result.get("action", [])
             if not actions:
                 return EpisodeResult(False, step, "Empty action chunk from server", action_log)
@@ -820,6 +848,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup_steps", type=int, default=10, help="Stabilization steps with dummy actions")
     parser.add_argument("--max_steps", type=int, default=0, help="Override max steps per episode (0=default)")
+    parser.add_argument(
+        "--reference_step_budget",
+        action="store_true",
+        help="Run the warmup steps on top of the step limit (max_steps + warmup_steps environment steps), as the "
+        "reference LIBERO evaluation of OpenVLA-OFT does (t < max_steps + num_steps_wait)",
+    )
+    parser.add_argument(
+        "--send_state",
+        action="store_true",
+        help="Send the 8D proprioceptive state (EEF position, axis-angle, finger joints) with each request",
+    )
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds")
     parser.add_argument("--wait_timeout", type=float, default=60.0, help="Seconds to wait for server health")
     parser.add_argument("--seed", type=int, default=0)
@@ -976,8 +1015,8 @@ def _run_task_vectorized(
     venv = SubprocVectorEnv([env_fn for _ in range(n)])
     try:
         venv.seed(seed)
-        for w0 in range(0, len(runnable), n):
-            wave = runnable[w0 : w0 + n]          # trial indices for this wave
+        for start in range(0, len(runnable), n):
+            wave = runnable[start : start + n]          # trial indices for this wave
             slots = list(range(len(wave)))        # env slots in use
             t_wave0 = time.perf_counter()
             venv.reset(id=slots)
@@ -1005,8 +1044,9 @@ def _run_task_vectorized(
                     _get_libero_images(obs_by_slot[s], cameras, flip_images=flip_images, rotate_180=rotate_180)
                     for s in active
                 ]
+                states = [_libero_state(obs_by_slot[s]) for s in active] if client.send_state else None
                 try:
-                    chunks = client.predict_batch(obs_batch)
+                    chunks = client.predict_batch(obs_batch, states)
                 except Exception as e:  # noqa: BLE001
                     for s in active:
                         done[s] = True
@@ -1089,6 +1129,7 @@ def main() -> None:
         image_size=args.image_size,
         timeout=args.timeout,
     )
+    client.send_state = bool(args.send_state)
     print(f"MuJoCo GL backend: {mujoco_backend}", flush=True)
     print("Waiting for model server...", flush=True)
     _wait_for_server(client, args.wait_timeout)
@@ -1104,6 +1145,9 @@ def main() -> None:
         selected_task_ids = list(range(num_tasks))
 
     max_steps = args.max_steps if args.max_steps > 0 else TASK_MAX_STEPS[args.task_suite]
+    if args.reference_step_budget:
+        # The warmup steps count inside the episode loop; the reference budget adds them to the step limit.
+        max_steps += args.warmup_steps
 
     total_episodes = 0
     total_successes = 0

@@ -4,36 +4,63 @@
 from __future__ import annotations
 
 import collections
+import copy
+import dataclasses
+import inspect
 import json
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from einops import rearrange
+from omegaconf import OmegaConf, open_dict
 from torch.distributed._composable.fsdp import FSDPModule
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
+from cosmos_framework.utils.flags import DEVICE, Device
 from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.lazy_config.registry import locate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
+    ACTION_SLOT_SAMPLE_COUNT_KEY,
+    ACTION_SLOT_SAMPLE_LOSS_KEY,
+    ActionSlotLossStats,
+    compute_flow_matching_loss,
+)
 from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
-from cosmos_framework.data.generator.action.action_processing import ActionProcessor, get_action_processing_records
+from cosmos_framework.configs.base.defaults.parallelism import PRECISION_TO_TORCH_DTYPE
+from cosmos_framework.data.generator.action.utils.action_masks import mask_action_values
+from cosmos_framework.data.generator.action.utils.action_processing import (
+    ActionProcessor,
+    get_action_processing_records,
+)
+from cosmos_framework.data.generator.action.utils.unified_action_schema import UNIFIED_ACTION_SLOT_GROUPS
 from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
 from cosmos_framework.model.generator.diffusion.samplers.unipc import UniPCSampler, UniPCSamplerConfig
-from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_broadcast_tensor_list
+from cosmos_framework.model.generator.mot.context_parallel_utils import (
+    broadcast_context_parallel_object,
+    context_parallel_broadcast_tensor_list,
+)
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
+from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
+    InferenceTextKVMemoryState,
+    UndKVCache,
+    install_inference_memory_attention_dispatch,
+    make_inference_text_kv_cache,
+    restore_inference_attention_dispatch,
+)
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
@@ -44,6 +71,7 @@ from cosmos_framework.model.generator.utils.data_and_condition import (
     build_dense_sound_schedule,
     unwrap_and_densify,
 )
+from cosmos_framework.model.generator.utils.load_balancing_stats import LBLConfig
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.model.generator.utils.moe_utils import (
     sync_expert_biases_to_ema,
@@ -56,6 +84,12 @@ from cosmos_framework.model.generator.utils.moe_utils import (
 from cosmos_framework.model.generator.utils.safetensors_loader import (
     load_language_model as load_language_model_safetensors,
 )
+from cosmos_framework.model.generator.vision_encoder import (
+    VisionEncoder,
+    get_vae_pixel_shapes,
+    normalize_uint8_item,
+    validate_multiview_length,
+)
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
     SequencePlan,
@@ -63,12 +97,202 @@ from cosmos_framework.data.generator.sequence_packing import (
     pack_input_sequence,
 )
 from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
+from cosmos_framework.data.generator.sequence_packing.packers import is_item_generated
 from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
-from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
+from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+
+
+def _all_group_ranks_allow(
+    local_eligible: bool,
+    process_group: torch.distributed.ProcessGroup | None,
+    device: torch.device | str | None,
+) -> bool:
+    """Return whether every rank in ``process_group`` is locally eligible."""
+    if process_group is None:
+        return local_eligible
+    eligible = torch.tensor([local_eligible], device=device, dtype=torch.uint8)
+    torch.distributed.all_reduce(eligible, op=torch.distributed.ReduceOp.MIN, group=process_group)
+    return bool(eligible.item())
+
+
+def _initial_noise(
+    source: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device | str, seed: int
+) -> torch.Tensor:
+    """Initial sampling noise of one stream (``inference_noise_source`` of the model config)."""
+    if source == "torch_cuda":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        return torch.randn(shape, dtype=dtype, device=device, generator=generator)
+    return misc.arch_invariant_rand(shape, dtype, device, seed)
+
+
+def _any_dp_shard_rank_needs_guidance_path(
+    local_needs_guidance_path: bool,
+    dp_shard_group: torch.distributed.ProcessGroup | None,
+    device: torch.device | str | None,
+) -> bool:
+    """Enter the guidance path on every FSDP shard rank when any rank needs it."""
+    if dp_shard_group is None:
+        return local_needs_guidance_path
+    needed = torch.tensor([local_needs_guidance_path], device=device, dtype=torch.uint8)
+    torch.distributed.all_reduce(needed, op=torch.distributed.ReduceOp.MAX, group=dp_shard_group)
+    return bool(needed.item())
+
+
+def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
+    """Return whether the primary ``video`` stream carries LiDAR clips (V0 or V1)."""
+    value = data_batch.get("vision_tokenizer_type")
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return False
+        value = value[0]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value == "lidar"
+
+
+def _vision_condition_masks(packed_sequence: PackedSequence) -> list[torch.Tensor]:
+    """Per-vision-item condition masks, empty when the batch generates no camera stream.
+
+    Packing represents an absent modality as ``None``. The LiDAR-only recipe is the first
+    batch to generate without a camera, so the walks over vision items read their masks
+    here and simply walk nothing, rather than each testing for the absent stream.
+    """
+    if packed_sequence.vision is None:
+        return []
+    assert isinstance(packed_sequence.vision.condition_mask, list), "Vision condition mask must be a list of tensors"
+    return packed_sequence.vision.condition_mask
+
+
+def _densify_action_family(
+    raw_actions: list | torch.Tensor | None, raw_families: str | list | tuple | None, expected_rows: int
+) -> list[str] | None:
+    """Align optional dataset names with the dense, action-bearing rows."""
+    if raw_actions is None or raw_families is None:
+        return None
+    actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+    families = [raw_families] if isinstance(raw_families, str) else raw_families
+    if not isinstance(families, (list, tuple)) or len(actions) != len(families):
+        return None
+
+    result: list[str] = []
+    for action, family in zip(actions, families, strict=True):
+        if isinstance(action, list):
+            if len(action) != 1:
+                return None
+            action = action[0]
+        if action is None:
+            continue
+        if not isinstance(family, str) or not family:
+            return None
+        result.append(family)
+    return result if len(result) == expected_rows else None
+
+
+def _densify_action_contract_ids(
+    raw_actions: list | torch.Tensor | None,
+    raw_contract_ids: list | torch.Tensor | None,
+    to_kwargs: dict,
+    raw_conditioning_contract_ids: list | None = None,
+    raw_plans: list | None = None,
+) -> list[torch.Tensor] | None:
+    """Align optional contract IDs with action-bearing samples.
+
+    A packed action modality must use one routing scheme throughout: either
+    every action row has a contract ID, or every row uses the legacy domain
+    ID. Silently dropping missing IDs would shift projector selection onto the
+    wrong samples, so mixed metadata fails closed. An optional clean-prefix
+    contract expands only the internal routing IDs; batch telemetry stays scalar.
+    """
+    if raw_actions is None or raw_contract_ids is None:
+        return None
+    actions = raw_actions if isinstance(raw_actions, list) else [raw_actions]
+    contract_ids = raw_contract_ids if isinstance(raw_contract_ids, list) else [raw_contract_ids]
+    if len(actions) != len(contract_ids):
+        raise ValueError(
+            "action_contract_id must align 1:1 with action samples; got %d actions and %d IDs"
+            % (len(actions), len(contract_ids))
+        )
+
+    if raw_conditioning_contract_ids is not None and all(
+            value is None or (isinstance(value, list) and value == [None])
+            for value in raw_conditioning_contract_ids):
+        raw_conditioning_contract_ids = None
+    if raw_conditioning_contract_ids is not None:
+        # Packed batches may omit visual-only action rows while retaining all
+        # sequence plans. Select the action plans before aligning prefix IDs.
+        if raw_plans is not None and len(raw_plans) != len(actions):
+            raw_plans = [plan for plan in raw_plans if plan.has_action]
+        if (len(raw_conditioning_contract_ids) != len(actions) or raw_plans is None
+                or len(raw_plans) != len(actions)):
+            raise ValueError("Conditioning contract IDs require aligned actions and sequence plans")
+    aligned: list[torch.Tensor | None] = []
+    for index, (action, contract_id) in enumerate(zip(actions, contract_ids, strict=True)):
+        if isinstance(action, list):
+            if len(action) != 1:
+                raise ValueError("nested action entries must contain exactly one item")
+            action = action[0]
+        if isinstance(contract_id, list):
+            if len(contract_id) != 1:
+                raise ValueError("nested action_contract_id entries must contain exactly one item")
+            contract_id = contract_id[0]
+        if contract_id is not None:
+            contract_id = torch.as_tensor(contract_id, dtype=torch.long)
+        conditioning_id = raw_conditioning_contract_ids[index] if raw_conditioning_contract_ids is not None else None
+        if isinstance(conditioning_id, list):
+            if len(conditioning_id) != 1:
+                raise ValueError("Conditioning contract entries must contain exactly one item")
+            conditioning_id = conditioning_id[0]
+        if conditioning_id is not None:
+            plan = raw_plans[index]
+            if isinstance(plan, list):
+                plan = plan[0]
+            if (action is None or contract_id is None or contract_id.numel() != 1
+                    or torch.as_tensor(conditioning_id).numel() != 1
+                    or plan.condition_frame_indexes_action != [0] or action.shape[0] < 2):
+                raise ValueError("Conditioning contract requires one clean prefix and future action targets")
+            contract_id = contract_id.reshape(1).expand(action.shape[0]).clone()
+            contract_id[0] = torch.as_tensor(conditioning_id).reshape(())
+        if action is not None:
+            aligned.append(contract_id)
+
+    present = [value is not None for value in aligned]
+    if any(present) and not all(present):
+        raise ValueError(
+            "cannot mix contract-routed and legacy action samples in one packed batch"
+        )
+    if not any(present):
+        return None
+    return [value.to(**to_kwargs) for value in aligned if value is not None]
+
+
+def _layout_names_to_ids(raw_layouts: list | str | None) -> list | torch.Tensor | None:
+    """Resolve source layout names once at the reader boundary, preserving batch nesting."""
+    if raw_layouts is None:
+        return None
+    from greenwam.data.semantic_space import SemanticSpace
+
+    space = SemanticSpace.load()
+
+    def _one(value: object) -> object:
+        if value is None or isinstance(value, torch.Tensor):
+            return value
+        if isinstance(value, str):
+            return torch.tensor(space.layout_id(value), dtype=torch.long)
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise ValueError("nested action_layout entries must contain exactly one item")
+            return [_one(value[0])]
+        return torch.as_tensor(value, dtype=torch.long)
+
+    return [_one(value) for value in raw_layouts] if isinstance(raw_layouts, list) else _one(raw_layouts)
+
+
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -79,6 +303,12 @@ class OmniMoTModel(ImaginaireModel):
 
     def __init__(self, config: OmniMoTModelConfig):
         super().__init__()
+        # This rank's post-tokenizer payload, encoded once at the start of each
+        # CP data window and retained until every CP rank has owned one slot.
+        self._cp_local_training_payload: dict[str, Any] | None = None
+        # Current owner rank in the CP data window; advances modulo CP size after
+        # each successful training step and returns to 0 for the next window.
+        self._cp_window_slot: int = 0
         self.config = config
         log.info(f"OmniMoTModel: config {self.config}")
 
@@ -100,10 +330,8 @@ class OmniMoTModel(ImaginaireModel):
         # 5. Set up training time scheduler and inference time sampler
         self.set_up_scheduler_and_sampler()
 
-        self.log_enc_time_every_n = config.log_enc_time_every_n
-
     def set_precision(self) -> None:
-        self.precision = getattr(torch, self.config.precision)
+        self.precision = PRECISION_TO_TORCH_DTYPE[self.config.precision]
         self.tensor_kwargs = {"device": DEVICE, "dtype": self.precision}
         self.tensor_kwargs_fp32 = {"device": DEVICE, "dtype": torch.float32}
         log.warning(f"OmniMoTModel: precision {self.precision}")
@@ -158,13 +386,44 @@ class OmniMoTModel(ImaginaireModel):
         self.llm_special_tokens = special_tokens
         self.llm_special_tokens["eos_token_id"] = vlm_tokenizer.eos_token_id
 
-        # 2. Vision tokenizer (images/videos) for generation.
-        self.tokenizer_vision_gen: VideoTokenizerInterface = lazy_instantiate(self.config.tokenizer)
-        assert self.tokenizer_vision_gen.latent_ch == self.config.state_ch, (
-            f"vision tokenizer latent_ch {self.tokenizer_vision_gen.latent_ch} != state_shape {self.config.state_ch}"
-        )
-        if hasattr(self.tokenizer_vision_gen, "reset_dtype"):
-            self.tokenizer_vision_gen.reset_dtype()
+        # 2. Vision tokenizer (images/videos) for generation. Reasoner-only
+        # inference does not encode or decode generation latents, so it can
+        # leave the VAE unloaded.
+        self.tokenizer_vision_gen: VideoTokenizerInterface | None = None
+        if self.config.load_vision_tokenizer:
+            self.tokenizer_vision_gen = lazy_instantiate(self.config.tokenizer)
+            assert self.tokenizer_vision_gen.latent_ch == self.config.state_ch, (
+                f"vision tokenizer latent_ch {self.tokenizer_vision_gen.latent_ch} != state_shape {self.config.state_ch}"
+            )
+            if hasattr(self.tokenizer_vision_gen, "reset_dtype"):
+                self.tokenizer_vision_gen.reset_dtype()
+        else:
+            log.info("Vision tokenizer initialization skipped")
+
+        # 2b. LiDAR VAE for the range-view stream, so one sample can carry camera clips
+        # alongside LiDAR clips. Its latent_ch deliberately differs from state_ch: the
+        # network gives LiDAR its own projections into and out of the sequence, which is
+        # why lidar_state_ch has to agree with this VAE, not with state_ch.
+        self.tokenizer_lidar_gen: VideoTokenizerInterface | None = None
+        if self.config.lidar_tokenizer is not None and self.config.load_vision_tokenizer:
+            self.tokenizer_lidar_gen = lazy_instantiate(self.config.lidar_tokenizer)
+            if self.config.lidar_state_ch is None:
+                raise ValueError("lidar_state_ch must be set when lidar_tokenizer is configured.")
+            if self.tokenizer_lidar_gen.latent_ch != self.config.lidar_state_ch:
+                raise ValueError(
+                    f"LiDAR tokenizer latent_ch {self.tokenizer_lidar_gen.latent_ch} != "
+                    f"lidar_state_ch {self.config.lidar_state_ch}; the LiDAR projection heads are sized "
+                    "from lidar_state_ch, so a mismatch would silently project the wrong width."
+                )
+            if self.config.lidar_fps is None or self.config.lidar_fps <= 0:
+                raise ValueError(
+                    f"lidar_fps must be a positive sweep rate when lidar_tokenizer is configured, got "
+                    f"{self.config.lidar_fps}. Without it the packer has no way to convert a LiDAR "
+                    "latent index into seconds and would silently place sweeps on the camera's rate."
+                )
+            if hasattr(self.tokenizer_lidar_gen, "reset_dtype"):
+                self.tokenizer_lidar_gen.reset_dtype()
+            log.info(f"LiDAR tokenizer initialized: {type(self.tokenizer_lidar_gen).__name__}")
 
         # 3. Sound/audio tokenizer (optional)
         if self.config.sound_gen:
@@ -181,13 +440,50 @@ class OmniMoTModel(ImaginaireModel):
             self.tokenizer_sound_gen = None
 
 
-    def build_net(self, dtype: torch.dtype, *, lora_enabled: bool | None = None) -> torch.nn.Module:
+    def build_net(
+        self,
+        dtype: torch.dtype,
+        *,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        lora_enabled: bool | None = None,
+    ) -> torch.nn.Module:
+        """Build the VFM network, parallelize it, and materialize it on device.
+
+        Args:
+            dtype: dtype the network's parameters and buffers are *stored* in -- what the
+                optimizer steps and what the checkpoint holds. With ``mp_policy`` this is
+                the FSDP master dtype and is higher precision than the compute dtype.
+            mp_policy: FSDP2 mixed-precision policy (see :func:`parallelize_vfm_network`).
+                ``None`` runs forward/backward in ``dtype`` itself.
+            lora_enabled: Override for ``config.lora_enabled``.
+        """
         # Build model network and parallelize it.
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
         with torch.device("meta"):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
 
-            language_model = lazy_instantiate(self.vlm_config.model_instance)
+            sample_lbl_enabled = self.config.lbl.method == "sample" and (
+                self.config.lbl.coeff_und is not None or self.config.lbl.coeff_gen is not None
+            )
+            lbl_init_kwargs: dict[str, LBLConfig] = {}
+            if sample_lbl_enabled:
+                # Sample LBL is MoE-only. Dense wrappers reject this kwarg, so fail here
+                # with a clear message instead of a TypeError inside lazy_instantiate.
+                model_target = self.vlm_config.model_instance["_target_"]
+                model_cls = locate(model_target) if isinstance(model_target, str) else model_target
+                assert callable(model_cls), f"Expected a callable model target, got {model_target!r}"
+                assert "lbl_config" in inspect.signature(model_cls).parameters, (
+                    f"lbl.method='sample' requires an MoE model; got {getattr(model_cls, '__qualname__', model_cls)}"
+                )
+                lbl_init_kwargs = {"lbl_config": self.config.lbl}
+            model_instance = self.vlm_config.model_instance
+            # Configs written before the action expert existed have no such key: they build without it.
+            if getattr(self.config, "action_expert", False):
+                # The MoT config takes the action expert through create_vlm_config's setattr overrides.
+                model_instance = copy.deepcopy(model_instance)
+                with open_dict(model_instance.config) if OmegaConf.is_config(model_instance) else nullcontext():
+                    model_instance.config["action_expert"] = True
+            language_model = lazy_instantiate(model_instance, **lbl_init_kwargs)
 
             # NOTE: We pass "RF timesteps" to the network in the same scale as the scheduler
             # (i.e., roughly [0, num_train_timesteps]). The MoT network expects to internally
@@ -199,19 +495,41 @@ class OmniMoTModel(ImaginaireModel):
                 latent_patch_size=self.config.diffusion_expert_config.patch_spatial,
                 latent_downsample_factor=self.config.latent_downsample_factor,
                 latent_channel_size=self.config.state_ch,
+                lidar_latent_channel_size=self.config.lidar_state_ch,
                 max_latent_h=self.config.diffusion_expert_config.max_vae_latent_side_after_patchify,
                 max_latent_w=self.config.diffusion_expert_config.max_vae_latent_side_after_patchify,
                 max_latent_t=self.config.state_t,
                 enable_fps_modulation=self.config.diffusion_expert_config.enable_fps_modulation,
+                enable_vision_modality_embeddings=(
+                    self.config.diffusion_expert_config.enable_vision_modality_embeddings
+                ),
+                enable_media_modality_embedding=(self.config.diffusion_expert_config.enable_media_modality_embedding),
+                enable_action_modality_embedding=(self.config.diffusion_expert_config.enable_action_modality_embedding),
+                enable_sound_modality_embedding=(self.config.diffusion_expert_config.enable_sound_modality_embedding),
                 base_fps=self.config.diffusion_expert_config.base_fps,
                 vision_gen=self.config.vision_gen,
                 action_gen=self.config.action_gen,
                 sound_gen=self.config.sound_gen,
                 joint_attn_implementation=self.config.joint_attn_implementation,
+                use_multiview_flex_attention=self.config.flex_attention.enabled,
+                # configs written before these switches have no such keys
+                time_embedding_per_token=getattr(self.config, "time_embedding_per_token", False),
+                pad_segment_only_when_padded=getattr(self.config, "pad_segment_only_when_padded", False),
+                flex_attention_backend=self.config.flex_attention.backend,
+                attention_scope=self.config.flex_attention.mask.attention_scope,
+                decomposed_temporal_window_seconds=self.config.flex_attention.mask.decomposed_temporal_window_seconds,
                 timestep_scale=1.0 / float(num_train_timesteps) * self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
+                native_action_dim=self.config.native_action_dim,
                 num_embodiment_domains=self.config.num_embodiment_domains,
-                temporal_compression_factor_vision=self.tokenizer_vision_gen.temporal_compression_factor,
+                num_action_contracts=self.config.num_action_contracts,
+                semantic_projectors=self.config.semantic_projectors,
+                action_io_projector_type=self.config.action_io_projector_type,
+                temporal_compression_factor_vision=(
+                    self.tokenizer_vision_gen.temporal_compression_factor
+                    if self.tokenizer_vision_gen is not None
+                    else self.config.tokenizer.temporal_compression_factor
+                ),
                 natten_parameter_list=self.config.natten_parameter_list,
                 video_temporal_causal=self.config.video_temporal_causal,
                 # Sound generation parameters
@@ -238,18 +556,31 @@ class OmniMoTModel(ImaginaireModel):
                     lora_target_modules=self.config.lora_target_modules,
                 )
 
+        # Swap ModelOpt FP8 linears BEFORE FSDP wrap and materialization, for the
+        # same reason LoRA is injected early. `fully_shard` wraps the whole network
+        # into one parameter group, so a linear replaced afterwards leaves the group
+        # holding a stale parameter; and `to_empty` below is what sets peak memory,
+        # which at bf16 shapes exceeds a single 80 GB device for a Super-class model.
+        if self.config.quantization.modelopt_fp8_checkpoint_path:
+            swap_modelopt_fp8_linears_on_meta(net, self.config.quantization.modelopt_fp8_target_fqns)
+
         self.install_attention_dispatch(net)
+
+        # Cast while still on meta (free -- no data to convert) and BEFORE sharding: each
+        # FSDP2 unit records its parameters' dtype as it is built, so a cast afterwards
+        # would leave ``mp_policy.reduce_dtype`` disagreeing with the sharded params.
+        net = net.to(dtype=dtype)
 
         net = parallelize_vfm_network(
             net,
             parallel_dims=self.parallel_dims,
             compile_config=self.config.compile,
             ac_config=self.config.activation_checkpointing,
-            attention_io_layout=self.config.parallelism.attention_io_layout,
+            attention_io_layout=getattr(self.config, "attention_io_layout", "sequence_sharded"),
+            mp_policy=mp_policy,
         )
 
         with misc.timer("meta to cuda and broadcast model states"):
-            net = net.to(dtype=dtype)
             net.to_empty(device=DEVICE)
             if DEVICE == Device.CUDA:
                 # Weight initialization is not needed for other devices (cpu,
@@ -363,9 +694,12 @@ class OmniMoTModel(ImaginaireModel):
     def set_up_model(self):
         assert hasattr(self, "parallel_dims"), "parallel_dims must be set"
         config = self.config
+
         with misc.timer("Creating PyTorch model and ema if enabled"):
-            self.net = self.build_net(dtype=self.precision)
+            master_dtype, mp_policy = _get_master_dtype_and_mp_policy(config, self.precision)
+            self.net = self.build_net(dtype=master_dtype, mp_policy=mp_policy)
             self._param_count = count_params(self.net, verbose=False)
+
             self._uses_aux_loss_free_load_balancing: bool = uses_aux_loss_free_load_balancing(self.net)
             self._uses_ema_router_bias: bool = uses_ema_router_bias(self.net)
 
@@ -410,45 +744,55 @@ class OmniMoTModel(ImaginaireModel):
             dp_shard=self.config.parallelism.data_parallel_shard_degree,
             cfgp=self.config.parallelism.cfg_parallel_shard_degree,
             cp=self.config.parallelism.context_parallel_shard_degree,
+            lb=self.config.parallelism.vae_load_balance_group_size,
         )
         self.parallel_dims.build_meshes(device_type=DEVICE)
 
     def set_up_scheduler_and_sampler(self):
-        # Get shift value - support both int and dict-based resolution lookup
-        # For scheduler initialization, use model's configured resolution
-        shift_config = self.config.rectified_flow_training_config.shift
-        if isinstance(shift_config, int):
-            shift = shift_config
-        else:
-            # shift set in RectifiedFlow is only used during inference.
-            # So, set it to the resolution of the model.
-            # This part gets executed only when we specify shift as a dict
-            # This is needed during multi-resolution training.
+        # Get shift values - support both int and dict-based resolution lookup.
+        rf_config = self.config.rectified_flow_training_config
+
+        def resolve_shift(shift_config: Any, dynamic_shift_key: str) -> int:
+            if isinstance(shift_config, int):
+                return shift_config
+
             shift_dict = dict(shift_config)
+            # Token-count-based dicts hold no per-resolution value; the shift is derived per batch
+            # in `_get_train_noise_level_vision`, so initialize the scheduler with the identity
+            # shift instead of failing the resolution lookup.
+            if dynamic_shift_key in shift_dict:
+                return 1
             resolution = self.config.resolution
             if resolution not in shift_dict:
                 raise ValueError(
                     f"Resolution '{resolution}' not found in shift dict. Available resolutions: {list(shift_dict.keys())}"
                 )
-            shift = shift_dict[resolution]
+            return shift_dict[resolution]
+
+        shift_video = resolve_shift(rf_config.shift, "dynamic_shift_base_num_tokens_video")
+        _shift_image_cfg = getattr(rf_config, "shift_image", None)
+        shift_image = resolve_shift(
+            _shift_image_cfg if _shift_image_cfg is not None else rf_config.shift,
+            "dynamic_shift_base_num_tokens_image",
+        )
 
         # Rectified Flow timestep scheduler and sampler for training (separate for image and video)
         if self.config.vision_gen:
             self.rectified_flow_image = RectifiedFlow(
                 velocity_field=self.net,
-                train_time_distribution=self.config.rectified_flow_training_config.train_time_image_distribution,
-                use_dynamic_shift=self.config.rectified_flow_training_config.use_dynamic_shift,
-                shift=shift,
-                train_time_weight_method=self.config.rectified_flow_training_config.train_time_weight,
+                train_time_distribution=rf_config.train_time_image_distribution,
+                use_dynamic_shift=rf_config.use_dynamic_shift,
+                shift=shift_image,
+                train_time_weight_method=rf_config.train_time_weight,
                 device=torch.device(DEVICE),
                 dtype=self.tensor_kwargs_fp32["dtype"],
             )
             self.rectified_flow_video = RectifiedFlow(
                 velocity_field=self.net,
-                train_time_distribution=self.config.rectified_flow_training_config.train_time_video_distribution,
-                use_dynamic_shift=self.config.rectified_flow_training_config.use_dynamic_shift,
-                shift=shift,
-                train_time_weight_method=self.config.rectified_flow_training_config.train_time_weight,
+                train_time_distribution=rf_config.train_time_video_distribution,
+                use_dynamic_shift=rf_config.use_dynamic_shift,
+                shift=shift_video,
+                train_time_weight_method=rf_config.train_time_weight,
                 device=torch.device(DEVICE),
                 dtype=self.tensor_kwargs_fp32["dtype"],
             )
@@ -457,7 +801,7 @@ class OmniMoTModel(ImaginaireModel):
                 velocity_field=self.net,
                 train_time_distribution=self.config.rectified_flow_training_config.train_time_action_distribution,
                 use_dynamic_shift=self.config.rectified_flow_training_config.use_dynamic_shift,
-                shift=shift,
+                shift=shift_video,
                 train_time_weight_method=self.config.rectified_flow_training_config.train_time_weight,
                 device=torch.device(DEVICE),
                 dtype=self.tensor_kwargs_fp32["dtype"],
@@ -467,7 +811,7 @@ class OmniMoTModel(ImaginaireModel):
                 velocity_field=self.net,
                 train_time_distribution=self.config.rectified_flow_training_config.train_time_sound_distribution,
                 use_dynamic_shift=self.config.rectified_flow_training_config.use_dynamic_shift,
-                shift=shift,
+                shift=shift_video,
                 train_time_weight_method=self.config.rectified_flow_training_config.train_time_weight,
                 device=torch.device(DEVICE),
                 dtype=self.tensor_kwargs_fp32["dtype"],
@@ -536,21 +880,26 @@ class OmniMoTModel(ImaginaireModel):
                 net=self.net,
                 device_mesh=dp_mesh,
             )
-            # expert_bias is a buffer, but the DTensor EMA worker copies parameters
-            # only, so mirror it into net_ema manually (else the persisted net_ema.*
-            # keeps zero and drops the trained bias at checkpoint save). update_bias
-            # already cross-rank-reduced, so net.expert_bias matches on every rank.
-            if self.config.ema.enabled:
-                sync_expert_biases_to_ema(net=self.net, net_ema=self.net_ema)
 
         # EMA-tracked token-constant de-sink bias (a checkpointed buffer). Independent of
         # expert-load bias correction; the update reduces the per-step token stats across the DP mesh so
-        # the buffer is identical on every rank. Like expert_bias it is a buffer, so it must
-        # be mirrored into net_ema (the model-EMA worker copies parameters only).
+        # the buffer is identical on every rank.
         if self._uses_ema_router_bias:
             update_router_biases(net=self.net, device_mesh=dp_mesh)
-            if self.config.ema.enabled:
-                sync_router_biases_to_ema(net=self.net, net_ema=self.net_ema)
+        self.sync_ema_buffers()
+
+    def sync_ema_buffers(self) -> None:
+        """Mirror checkpointed MoE buffers omitted by the parameter-only EMA worker.
+
+        Callers own any cross-rank source-buffer update before this seam; it only
+        copies the resulting persistent state into the checkpointed EMA network.
+        """
+        if not self.config.ema.enabled:
+            return
+        if self._uses_aux_loss_free_load_balancing:
+            sync_expert_biases_to_ema(net=self.net, net_ema=self.net_ema)
+        if self._uses_ema_router_bias:
+            sync_router_biases_to_ema(net=self.net, net_ema=self.net_ema)
 
     def on_before_zero_grad(
         self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LRScheduler, iteration: int
@@ -599,6 +948,9 @@ class OmniMoTModel(ImaginaireModel):
             base_fps=float(self.config.diffusion_expert_config.base_fps),
             sound_base_temporal_compression_factor=self.config.diffusion_expert_config.sound_base_temporal_compression_factor,
             temporal_compression_factor=self.tokenizer_vision_gen.temporal_compression_factor,
+            lidar_temporal_compression_factor=(
+                self.tokenizer_lidar_gen.temporal_compression_factor if self.tokenizer_lidar_gen is not None else None
+            ),
             vision_temporal_position_mode=self.config.diffusion_expert_config.vision_temporal_position_mode,
             video_temporal_causal=self.config.video_temporal_causal,
             action_dim=self.config.max_action_dim,
@@ -609,8 +961,17 @@ class OmniMoTModel(ImaginaireModel):
         self,
         raw_state_vision: list[torch.Tensor],
         x0_tokens_vision: list[torch.Tensor],
+        num_views_per_vision_item: list[int] | None = None,
+        frames_per_vision_item: list[int] | None = None,
     ) -> list[torch.Tensor] | None:
-        """Return optional per-latent temporal coordinates for vision tokens."""
+        """Return optional per-latent temporal coordinates for vision tokens.
+
+        Multiview items are currently flattened camera-major. Compute UniAE
+        positions for one independently encoded camera clip, retain explicit
+        view/time axes, and flatten them in the same order as the latents. A
+        future timestamp-major layout only needs to transpose those two axes
+        before flattening.
+        """
         mode = self.config.diffusion_expert_config.vision_temporal_position_mode
         if mode == "latent_index":
             return None
@@ -621,8 +982,31 @@ class OmniMoTModel(ImaginaireModel):
             )
 
         assert self.tokenizer_vision_gen is not None
+        if (num_views_per_vision_item is None) != (frames_per_vision_item is None):
+            raise ValueError("num_views_per_vision_item and frames_per_vision_item must be provided together.")
+        if num_views_per_vision_item is None:
+            num_views_per_vision_item = [1] * len(raw_state_vision)
+            frames_per_vision_item_optional: list[int | None] = [None] * len(raw_state_vision)
+        else:
+            assert frames_per_vision_item is not None
+            if len(num_views_per_vision_item) != len(raw_state_vision) or len(frames_per_vision_item) != len(
+                raw_state_vision
+            ):
+                raise ValueError(
+                    "Multiview temporal-position metadata must align with flattened vision items: "
+                    f"got {len(num_views_per_vision_item)} view counts, {len(frames_per_vision_item)} frame "
+                    f"counts, and {len(raw_state_vision)} vision items."
+                )
+            frames_per_vision_item_optional = list(frames_per_vision_item)
+
         temporal_positions_vision: list[torch.Tensor] = []
-        for raw_state_vision_i, x0_tokens_vision_i in zip(raw_state_vision, x0_tokens_vision, strict=True):
+        for raw_state_vision_i, x0_tokens_vision_i, num_views, frames_per_view in zip(
+            raw_state_vision,
+            x0_tokens_vision,
+            num_views_per_vision_item,
+            frames_per_vision_item_optional,
+            strict=True,
+        ):
             if raw_state_vision_i.dim() == 5:
                 num_pixel_frames = int(raw_state_vision_i.shape[2])
             elif raw_state_vision_i.dim() == 4:
@@ -636,11 +1020,50 @@ class OmniMoTModel(ImaginaireModel):
             frame_h = int(raw_state_vision_i.shape[-2])
             frame_w = int(raw_state_vision_i.shape[-1])
             resolution = get_vision_data_resolution((frame_h, frame_w))
-            temporal_positions = self.tokenizer_vision_gen.get_latent_temporal_positions(
-                num_pixel_frames=num_pixel_frames,
-                resolution=resolution,
-                num_latent_frames=num_latent_frames,
-            )  # [T_latent]
+
+            if num_views > 1:
+                if frames_per_view is None:
+                    raise ValueError("frames_per_view is required when num_views is greater than one.")
+                expected_pixel_frames = num_views * frames_per_view
+                if num_pixel_frames != expected_pixel_frames:
+                    raise ValueError(
+                        "Multiview vision length must equal num_views * frames_per_view when computing temporal "
+                        f"positions: got T={num_pixel_frames}, num_views={num_views}, "
+                        f"frames_per_view={frames_per_view}."
+                    )
+                if num_latent_frames % num_views != 0:
+                    raise ValueError(
+                        "Multiview latent length must be divisible by num_views when computing temporal positions: "
+                        f"got T={num_latent_frames}, num_views={num_views}."
+                    )
+                latent_frames_per_view = num_latent_frames // num_views
+                temporal_positions_per_view = self.tokenizer_vision_gen.get_latent_temporal_positions(
+                    num_pixel_frames=frames_per_view,
+                    resolution=resolution,
+                    num_latent_frames=latent_frames_per_view,
+                )  # [T_latent_view]
+                if temporal_positions_per_view is None:
+                    raise ValueError(
+                        f"{type(self.tokenizer_vision_gen).__name__} does not support "
+                        f"vision_temporal_position_mode={mode}."
+                    )
+                if temporal_positions_per_view.shape[0] != latent_frames_per_view:
+                    raise ValueError(
+                        "Vision temporal position count must match latent frames per view: "
+                        f"got {temporal_positions_per_view.shape[0]} positions for "
+                        f"{latent_frames_per_view} latent frames."
+                    )
+                temporal_positions_by_view = temporal_positions_per_view.unsqueeze(0).expand(
+                    num_views, -1
+                )  # [V,T_latent_view]
+                temporal_positions = temporal_positions_by_view.reshape(-1)  # [V*T_latent_view]
+            else:
+                temporal_positions = self.tokenizer_vision_gen.get_latent_temporal_positions(
+                    num_pixel_frames=num_pixel_frames,
+                    resolution=resolution,
+                    num_latent_frames=num_latent_frames,
+                )  # [T_latent]
+
             if temporal_positions is None:
                 raise ValueError(
                     f"{type(self.tokenizer_vision_gen).__name__} does not support vision_temporal_position_mode={mode}."
@@ -720,6 +1143,189 @@ class OmniMoTModel(ImaginaireModel):
         """
         return memory_info
 
+    def _prepare_training_data(
+        self,
+        data_batch: dict[str, torch.Tensor],
+        iteration: int,
+    ) -> tuple[
+        list[list[int]],
+        list[SequencePlan],
+        GenerationDataClean,
+        dict,
+        list[str] | None,
+        list[tuple[int, int, int]],
+    ]:
+        """Run local tokenization and return the typed inputs needed by training.
+
+        ``balance_vae_encode=True`` lets :meth:`get_data_and_condition` spread this step's
+        VAE-encode COMPUTE across the ``lb`` group (see ``models/mot/vae_load_balance.py``)
+        rather than having every rank encode exactly its own pixels. Only the compute moves:
+        ``encode(pixels) -> latent`` is a pure function of the pixel tensor, so no sample
+        changes owner and every other per-sample field (caption, image_size, sequence-packing
+        slot, sound/action/lidar counterparts) stays paired with its sample exactly as it
+        always was.
+
+        Training is the only caller that opts in. Inference and the visualization callbacks
+        leave it off deliberately: balancing runs collectives over the whole ``lb`` group, and
+        those paths are not guaranteed to run on every rank of it.
+        """
+        input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)
+        sequence_plans = build_sequence_plans_from_data_batch(
+            data_batch=data_batch,
+            input_video_key=self.input_video_key,
+            input_image_key=self.input_image_key,
+        )
+        per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
+        gen_data_clean = self.get_data_and_condition(
+            data_batch,
+            retain_raw_state_vision=not per_camera_vae_encoding,
+            balance_vae_encode=True,
+        )
+        # Account for every item encoded by the VAE, even if memory initialization
+        # later removes or truncates items before sequence packing.
+        vae_pixel_shapes = get_vae_pixel_shapes(gen_data_clean.raw_state_vision)
+        gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
+
+        # image_size[i] may be (1, 4) from IterativeJointDataLoader or (4,) from custom_collate_fn.
+        if "image_size" in data_batch:
+            data_resolutions: list[str] | str | None = []
+            for i in range(gen_data_clean.batch_size):
+                img_size = data_batch["image_size"][i]
+                if img_size.dim() == 2:
+                    img_size = img_size[0]
+                target_h = int(img_size[0].item())
+                target_w = int(img_size[1].item())
+                data_resolutions.append(get_vision_data_resolution((target_h, target_w)))
+        elif sequence_plans and not any(plan.has_vision for plan in sequence_plans):
+            # A vision-less batch -- the LiDAR-only recipe -- still samples the per-sample vision
+            # timestep, because that is the clock LiDAR borrows. There is no camera frame to
+            # bucket, so the noise-schedule shift comes from the run's configured resolution.
+            data_resolutions = self.config.resolution
+        else:
+            data_resolutions = None
+
+        if per_camera_vae_encoding:
+            # Training needs only the encoded latents after memory initialization.
+            gen_data_clean.raw_state_vision = None
+        return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
+
+    @staticmethod
+    def _pack_training_payload(
+        input_text_indexes: list[list[int]],
+        sequence_plans: list[SequencePlan],
+        gen_data_clean: GenerationDataClean,
+        memory_info: dict,
+        data_resolutions: list[str] | str | None,
+        vae_pixel_shapes: list[tuple[int, int, int]],
+    ) -> dict[str, Any]:
+        """Convert typed training inputs into a plain tree for CP broadcast."""
+        # Keep shallow tensor references
+        gen_data_clean_payload = {
+            field.name: getattr(gen_data_clean, field.name) for field in dataclasses.fields(GenerationDataClean)
+        }
+        # Raw pixels/audio/action/LiDAR are unused after tokenization; omit them from the CP cache.
+        for key in ("raw_state_vision", "raw_state_sound", "raw_state_action", "raw_state_lidar"):
+            gen_data_clean_payload.pop(key)
+        return {
+            "input_text_indexes": input_text_indexes,
+            "sequence_plans": [dataclasses.asdict(plan) for plan in sequence_plans],
+            "gen_data_clean": gen_data_clean_payload,
+            "memory_info": memory_info,
+            "data_resolutions": data_resolutions,
+            "vae_pixel_shapes": vae_pixel_shapes,
+        }
+
+    @staticmethod
+    def _unpack_training_payload(
+        payload: dict[str, Any],
+    ) -> tuple[
+        list[list[int]],
+        list[SequencePlan],
+        GenerationDataClean,
+        dict,
+        list[str] | None,
+        list[tuple[int, int, int]],
+    ]:
+        expected = {
+            "input_text_indexes",
+            "sequence_plans",
+            "gen_data_clean",
+            "memory_info",
+            "data_resolutions",
+            "vae_pixel_shapes",
+        }
+        if set(payload) != expected:
+            raise ValueError(f"Unexpected CP payload keys: {set(payload) ^ expected}")
+        input_text_indexes = payload["input_text_indexes"]
+        sequence_plans = [SequencePlan(**plan) for plan in payload["sequence_plans"]]
+        gen_data_clean = GenerationDataClean(**payload["gen_data_clean"])
+        memory_info = payload["memory_info"]
+        data_resolutions = payload["data_resolutions"]
+        vae_pixel_shapes = payload["vae_pixel_shapes"]
+        return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
+
+    def _get_training_inputs(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[
+        list[list[int]],
+        list[SequencePlan],
+        GenerationDataClean,
+        dict,
+        list[str] | None,
+        list[tuple[int, int, int]],
+    ]:
+        """Prepare inputs using a context-parallel (CP) data-window rotation.
+
+        A CP group of size ``C`` processes a window of ``C`` rank-local batches
+        over ``C`` consecutive training steps. Each position in that window is
+        a *slot*, and CP rank ``s`` owns slot ``s``.
+
+        At slot 0, every rank independently tokenizes/encodes its own raw batch
+        once and stores the post-tokenizer payload in
+        ``self._cp_local_training_payload``. At slot ``s``, owner rank ``s``
+        broadcasts its cached payload, and all CP ranks execute that training
+        step on the same owner batch (the packed sequence is sharded across
+        those ranks later).
+
+        ``self._cp_window_slot`` advances modulo ``C`` after each step. After
+        slot ``C - 1``, the cache is cleared and the slot resets to 0, beginning
+        the next window. Thus each rank fetches and encodes one local batch per
+        window; later slots reuse the cache rather than encoding raw data again.
+        """
+        cp_enabled = self.parallel_dims is not None and self.parallel_dims.cp_enabled
+        if not cp_enabled:
+            if self.parallel_dims is None or self.parallel_dims.cp_rank == 0:
+                self._update_train_stats(data_batch)
+            return self._prepare_training_data(data_batch, iteration)
+
+        cp_size = self.parallel_dims.cp_mesh.size()
+        cp_window_slot = self._cp_window_slot
+        if not 0 <= cp_window_slot < cp_size:
+            raise ValueError(f"CP data window slot must be in [0, {cp_size}), got {cp_window_slot}.")
+        # Slot 0: every CP rank encodes its local batch once and caches the payload.
+        # Later slots broadcast the current owner's cache; raw data is ignored.
+        if cp_window_slot == 0:
+            local_training_data = self._prepare_training_data(data_batch, iteration)
+            self._cp_local_training_payload = self._pack_training_payload(*local_training_data)
+        if self._cp_local_training_payload is None:
+            raise RuntimeError("CP training payload cache is empty before its data window is complete.")
+        payload = broadcast_context_parallel_object(
+            self._cp_local_training_payload,
+            self.parallel_dims,
+            owner_rank=cp_window_slot,
+        )
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a dictionary CP training payload, got {type(payload).__name__}.")
+        input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
+            self._unpack_training_payload(payload)
+        )
+        if cp_window_slot == cp_size - 1:
+            self._cp_local_training_payload = None
+        if self.parallel_dims.cp_rank == 0:
+            self._update_train_stats_from_processed_batch(gen_data_clean)
+        self._cp_window_slot = (cp_window_slot + 1) % cp_size
+        return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -744,38 +1350,9 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
-        if self.parallel_dims is None or self.parallel_dims.cp_rank == 0:
-            self._update_train_stats(data_batch)
-
-        # Load, apply dropout, and tokenize input captions
-        input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)
-
-        # Build sequence plans if not present. SequencePlan has the conditioning information.
-        sequence_plans = build_sequence_plans_from_data_batch(
-            data_batch=data_batch,
-            input_video_key=self.input_video_key,
-            input_image_key=self.input_image_key,
+        input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
+            self._get_training_inputs(data_batch, iteration)
         )
-
-        # Get data from raw data batch and tokenize into corresponding tokens for *generation* task
-        # The unnoised, tokenized data for the generation task.
-        gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)
-
-        gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
-
-        # Compute resolution per sample for per-sample shift lookup
-        # image_size[i] may be (1, 4) from IterativeJointDataLoader or (4,) from custom_collate_fn.
-        if "image_size" in data_batch:
-            data_resolutions = []
-            for i in range(gen_data_clean.batch_size):
-                img_size = data_batch["image_size"][i]
-                if img_size.dim() == 2:
-                    img_size = img_size[0]
-                target_h = int(img_size[0].item())
-                target_w = int(img_size[1].item())
-                data_resolutions.append(get_vision_data_resolution((target_h, target_w)))
-        else:
-            data_resolutions = None
 
         # Calculate number of tokens per sample (before 2x2 merge) for dynamic shift
         # gen_data_clean.x0_tokens_vision: B, C, T, H, W
@@ -912,9 +1489,26 @@ class OmniMoTModel(ImaginaireModel):
 
         # For image editing (multi-item vision), expand per-sample timesteps/sigmas to
         # per-vision-item so downstream noise/loss indexing matches the flat x0_tokens_vision
-        # list. No-op when num_vision_items_per_sample is None (standard T2I/T2V/policy cases).
+        # list. No-op when num_vision_items_per_sample is None (standard T2I/T2V/WAM cases).
         # Conditioning items get sigma=0 via their condition_mask, so the actual timestep value
         # for them does not matter.
+        # LiDAR shares the sample's vision schedule so both sensors denoise on one clock, then
+        # expands to per-LiDAR-item rows. Sampled before the vision expansion below, which
+        # rebinds timesteps_vision from per-sample to per-vision-item rows.
+        if gen_data_clean.num_lidar_items_per_sample is not None:
+            assert timesteps_vision.shape[1] == 1, (
+                "LiDAR reuses the sample's vision timestep, which requires a single timestep per sample "
+                "(diffusion forcing is not supported for joint camera + LiDAR batches)"
+            )
+            timesteps_lidar = _expand_per_sample_to_per_vision_item(
+                timesteps_vision, gen_data_clean.num_lidar_items_per_sample
+            )  # [B_lidar_items, 1]
+            sigmas_lidar = _expand_per_sample_to_per_vision_item(
+                sigmas_vision, gen_data_clean.num_lidar_items_per_sample
+            )  # [B_lidar_items, 1]
+        else:
+            timesteps_lidar, sigmas_lidar = (None, None)
+
         timesteps_vision = _expand_per_sample_to_per_vision_item(
             timesteps_vision, gen_data_clean.num_vision_items_per_sample
         )  # [B_items, T_vis]
@@ -931,6 +1525,7 @@ class OmniMoTModel(ImaginaireModel):
             sigmas_vision,
             sigmas_action=sigmas_action,
             sigmas_sound=sigmas_sound,
+            sigmas_lidar=sigmas_lidar,
             iteration=iteration,
         )
         self._replace_clean_with_noised(packed_sequence, gen_data_noised)
@@ -953,22 +1548,8 @@ class OmniMoTModel(ImaginaireModel):
             is_image_batch=gen_data_clean.is_image_batch,
             timesteps_action=timesteps_action,
             timesteps_sound=timesteps_sound,
+            timesteps_lidar=timesteps_lidar,
         )
-
-        # Pixel-space video shapes for VAE FLOPs estimation in callbacks (e.g. MFU).
-        _vae_pixel_shapes: list[tuple[int, int, int]] = []
-        if gen_data_clean.raw_state_vision is not None:
-            for _v in gen_data_clean.raw_state_vision:
-                if _v is not None:
-                    assert _v.dim() in [4, 5], (
-                        "Currently only [C, T, H, W] and [B, C, T, H, W] formats are supported for the VAE encoding."
-                    )
-                    t_h_w = (
-                        (int(_v.shape[2]), int(_v.shape[3]), int(_v.shape[4]))
-                        if _v.dim() == 5
-                        else (int(_v.shape[1]), int(_v.shape[2]), int(_v.shape[3]))
-                    )
-                    _vae_pixel_shapes.append(t_h_w)
 
         _vision_tokens = len(packed_sequence.vision.sequence_indexes) if packed_sequence.vision else 0
         _action_tokens = len(packed_sequence.action.sequence_indexes) if packed_sequence.action else 0
@@ -987,10 +1568,12 @@ class OmniMoTModel(ImaginaireModel):
             "action_token_length": _action_tokens,
             "sound_token_length": _sound_tokens,
             "is_image_batch": gen_data_clean.is_image_batch,
+            # Processed metadata follows the same CP broadcast and dense action-row filtering as the loss tensors.
+            "_action_family": getattr(gen_data_clean, "action_family", None),
             "batch_size": gen_data_clean.batch_size,
             "split_lens": packed_sequence.split_lens,
             "attn_modes": packed_sequence.attn_modes,
-            "vae_pixel_shapes": _vae_pixel_shapes,
+            "vae_pixel_shapes": vae_pixel_shapes,
             **losses_dict,
         }
         if sigmas_action is not None:
@@ -1009,33 +1592,11 @@ class OmniMoTModel(ImaginaireModel):
         has_valid_tokens: bool,
         rectified_flow: RectifiedFlow,
         raw_action_dim: list[torch.Tensor] | None = None,
+        action_valid_mask: list[torch.Tensor] | None = None,
         normalize_by_active: bool = False,
-    ) -> torch.Tensor:
-        """Compute flow matching loss for a modality.
-
-        Args:
-            pred: Predicted velocity field (list of tensors, one per sample).
-            target: Target velocity field (list of tensors, one per sample).
-                Under rectified flow the target is ``v = eps - x0``.
-            condition_mask: Mask where 1 = clean/conditioning, 0 = noisy/generation (list of tensors).
-            timesteps: Diffusion timesteps for time weighting. Shape [B,1] for
-                base/teacher_forcing (all frames share one timestep) or [B,T_max]
-                for diffusion_forcing (per-frame independent timesteps). Time weights
-                are applied per-frame before averaging, so non-uniform weight functions
-                are handled correctly.
-            has_valid_tokens: Whether this modality has valid noisy tokens.
-            rectified_flow: The rectified flow object for time weighting.
-            normalize_by_active: When True, normalize per-instance loss by the count of
-                active (noisy) elements rather than all elements. Preserves the
-                ``sum / active_count`` semantics needed for distillation critics where
-                conditioned frames contribute no signal and should not dilute the
-                denominator.
-
-        Returns:
-            tuple: A tuple containing two elements:
-                - Flow matching loss (or dummy loss for gradient consistency).
-                - Per-instance loss (or dummy loss for gradient consistency).
-        """
+        action_slot_stats: ActionSlotLossStats | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Preserve the instance API used by posttrain and interactive subclasses."""
         return compute_flow_matching_loss(
             pred=pred,
             target=target,
@@ -1045,8 +1606,79 @@ class OmniMoTModel(ImaginaireModel):
             rectified_flow=rectified_flow,
             tensor_kwargs_fp32=self.tensor_kwargs_fp32,
             raw_action_dim=raw_action_dim,
+            action_valid_mask=action_valid_mask,
             normalize_by_active=normalize_by_active,
+            action_slot_stats=action_slot_stats,
         )
+
+    def _get_load_balancing_loss_meshes(self) -> tuple[DeviceMesh | None, DeviceMesh | None]:
+        """Return the data- and context-parallel meshes used by load balancing loss."""
+        parallel_dims = getattr(self, "parallel_dims", None)
+        if parallel_dims is None:
+            return None, None
+
+        context_parallel_mesh = None
+        if parallel_dims.cp_enabled and self.config.attention_io_layout == "sequence_sharded":
+            context_parallel_mesh = parallel_dims.cp_mesh
+        return parallel_dims.dp_mesh, context_parallel_mesh
+
+    def _loss_averaging_group(self) -> tuple[torch.distributed.ProcessGroup | None, int]:
+        """Return the (process_group, size) over which gradients are averaged.
+
+        This must match the group FSDP/DDP averages gradients over so that scaling the
+        per-rank loss by ``size`` exactly counteracts the framework's mean reduction.
+        FSDP shards/replicates over ``parallel_dims.dp_mesh``; plain DDP averages over
+        the whole world. Returns ``(None, 1)`` when running without distributed, in
+        which case no reduction (and no scaling) is needed.
+
+        Note: ``ParallelDims.dp_mesh`` is always 2-D ``(dp_replicate, dp_shard)`` with
+        ``dp_replicate * dp_shard == world_size``, so FSDP/HSDP averages over the whole
+        world. ``DeviceMesh.get_group()`` requires ``mesh_dim`` when ``ndim > 1``; use
+        the default WORLD process group (``group=None``) instead of calling ``get_group()``.
+        """
+        if self.parallel_dims is not None and self.parallel_dims.dp_enabled:
+            dp_mesh = self.parallel_dims.dp_mesh
+            # WORLD group: dp mesh spans all ranks (see docstring). Avoid get_group() on 2-D mesh.
+            return None, dp_mesh.size()
+        if torch.distributed.is_initialized():
+            # No explicit dp mesh (e.g. bare DDP): gradients average over the whole world.
+            return None, torch.distributed.get_world_size()
+        return None, 1
+
+    def _sample_level_loss_scale(
+        self,
+        is_image_batch: bool,
+        num_samples: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Multiplier that converts rank-level to sample-level loss averaging.
+
+        A packed batch is homogeneous — either all image or all video (video may carry
+        accompanying action/audio) — with ``num_samples`` samples on this rank. Each
+        iteration the per-modality sample counts are all-reduced over the data-parallel
+        group to get the global totals ``N_image`` / ``N_video``, and this rank's batch is
+        scaled by ``group_size * num_samples / N_modality``.
+
+        Applied to the whole ``total_loss`` (video + action + audio for video batches),
+        this scales every term by the same factor, so the video/action/audio balance set
+        by ``loss_scale`` / ``action_loss_weight`` / ``sound_loss_scale`` is preserved,
+        while the effective objective becomes a per-sample mean. The base per-modality
+        weight already baked into ``total_loss`` (``loss_scale`` for video, ``image_loss_scale``
+        for image) cancels out of this multiplier, so it does not appear here. The
+        ``group_size`` factor cancels the framework's ``1/group_size`` gradient averaging;
+        for balanced batches (``num_samples ≈ N/group_size``) the scale is ≈ 1, so logged
+        loss magnitudes stay comparable to rank-level averaging.
+        """
+        dp_group, group_size = self._loss_averaging_group()
+
+        # counts = [num_local_image_samples, num_local_video_samples]; exactly one is non-zero.
+        counts = torch.zeros(2, dtype=torch.float64, device=device)
+        counts[0 if is_image_batch else 1] = float(num_samples)
+        if group_size > 1:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+
+        global_num_samples = (counts[0] if is_image_batch else counts[1]).clamp(min=1.0)
+        return (group_size * num_samples) / global_num_samples
 
     def _compute_losses(
         self,
@@ -1057,6 +1689,7 @@ class OmniMoTModel(ImaginaireModel):
         is_image_batch: bool,
         timesteps_action: torch.Tensor | None = None,
         timesteps_sound: torch.Tensor | None = None,
+        timesteps_lidar: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute flow matching loss and auxiliary load balancing losses.
 
@@ -1078,19 +1711,25 @@ class OmniMoTModel(ImaginaireModel):
         rf_cfg = self.config.rectified_flow_training_config
         normalize_by_active = rf_cfg.normalize_loss_by_active
         if self.config.vision_gen:
-            assert data_batch_packed.vision is not None, "Vision packed data required when vision_gen is True"
-            assert isinstance(data_batch_packed.vision.condition_mask, list), (
-                "Vision condition mask must be a list of tensors for loss computation"
+            # Only a batch that generates no camera stream, as the LiDAR-only recipe does, may
+            # arrive with vision unpacked; for anything else that would silently sink the vision
+            # loss into the dummy loss below.
+            assert data_batch_packed.vision is not None or not gen_data_noised.vt_target_vision, (
+                "Vision packed data required when the batch carries camera items"
             )
             rectified_flow_vision = self.rectified_flow_image if is_image_batch else self.rectified_flow_video
 
-            fm_loss_vision, fm_loss_vision_per_instance = self._compute_flow_matching_loss(
+            # With no camera stream there are no noisy vision tokens, so this returns its dummy
+            # loss over the network's zero-weighted vision predictions. That is what keeps
+            # vae2llm and llm2vae in the backward graph on every rank, which FSDP requires.
+            fm_loss_vision, fm_loss_vision_per_instance = compute_flow_matching_loss(
                 pred=out_net["preds_vision"],
                 target=gen_data_noised.vt_target_vision,
-                condition_mask=data_batch_packed.vision.condition_mask,
+                condition_mask=_vision_condition_masks(data_batch_packed),
                 timesteps=timesteps,
                 has_valid_tokens=has_noisy_tokens(data_batch_packed.vision),
                 rectified_flow=rectified_flow_vision,
+                tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                 normalize_by_active=normalize_by_active,
             )
             loss_scale = (
@@ -1102,32 +1741,129 @@ class OmniMoTModel(ImaginaireModel):
         else:
             losses_dict["flow_matching_loss_vision"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
 
+        # Same condition the network builds its LiDAR projections under, so the two cannot
+        # disagree about whether this run has a LiDAR stream to supervise.
+        if self.config.vision_gen and self.config.lidar_state_ch is not None:
+            if data_batch_packed.lidar is not None:
+                assert isinstance(data_batch_packed.lidar.condition_mask, list), (
+                    "LiDAR condition mask must be a list of tensors for loss computation"
+                )
+                assert gen_data_noised.vt_target_lidar is not None, "LiDAR targets required when the batch has LiDAR"
+                fm_loss_lidar, _ = compute_flow_matching_loss(
+                    pred=out_net["preds_lidar"],
+                    target=gen_data_noised.vt_target_lidar,
+                    condition_mask=data_batch_packed.lidar.condition_mask,
+                    timesteps=timesteps_lidar if timesteps_lidar is not None else timesteps,
+                    has_valid_tokens=has_noisy_tokens(data_batch_packed.lidar),
+                    rectified_flow=self.rectified_flow_video,
+                    tensor_kwargs_fp32=self.tensor_kwargs_fp32,
+                    normalize_by_active=normalize_by_active,
+                )
+                lidar_loss_scale = rf_cfg.lidar_loss_scale if rf_cfg.lidar_loss_scale is not None else rf_cfg.loss_scale
+                total_loss += fm_loss_lidar * lidar_loss_scale
+                losses_dict["flow_matching_loss_lidar"] = fm_loss_lidar
+            else:
+                # No LiDAR data in this batch. Connect the network's dummy preds_lidar to the
+                # loss so lidar2llm / llm2lidar stay in the backward graph, or FSDP's gradient
+                # reduce hangs against the ranks that did draw LiDAR.
+                #
+                # _decode_grid_stream returns [probe] for an absent stream -- one tensor that
+                # has already been through both projections -- which is what makes the sum
+                # below a tensor rather than the int that `sum` returns for an empty list.
+                # That int would multiply to a plain float, dropping the projections from the
+                # graph and producing exactly the hang above, so assert the guarantee here
+                # rather than rely on a reader knowing the other file.
+                preds_lidar = out_net["preds_lidar"]
+                assert preds_lidar, (
+                    "preds_lidar must carry the network's zero-weighted probe so lidar2llm / "
+                    "llm2lidar stay in the backward graph on a batch with no LiDAR"
+                )
+                dummy_loss = 0.0 * sum(p.sum() for p in preds_lidar)
+                total_loss += dummy_loss
+                losses_dict["flow_matching_loss_lidar"] = dummy_loss
+
         if self.config.action_gen:
             if data_batch_packed.action is not None:
                 assert isinstance(data_batch_packed.action.condition_mask, list), (
                     "Action condition mask must be a list of tensors for loss computation"
                 )
                 assert gen_data_noised.vt_target_action is not None, "Action targets required when action_gen is True"
-                fm_loss_action, _ = self._compute_flow_matching_loss(
+                action_has_valid_tokens = has_noisy_tokens(data_batch_packed.action)
+                num_action_samples = len(out_net["preds_action"])
+                slot_stat_zeros = out_net["preds_action"][0].new_zeros(
+                    (num_action_samples, len(UNIFIED_ACTION_SLOT_GROUPS)), dtype=torch.float32
+                )
+                action_slot_stats = ActionSlotLossStats(
+                    sample_loss=slot_stat_zeros,
+                    sample_count=torch.zeros_like(slot_stat_zeros),
+                )
+                body_part_ids = None
+                action_valid_mask_for_loss = data_batch_packed.action.action_valid_mask
+                if self.config.semantic_projectors and data_batch_packed.action.action_contract_id:
+                    from greenwam.data.semantic_space import SemanticSpace, restrict_action_valid_mask_to_shared
+                    space = SemanticSpace.load()
+                    if not data_batch_packed.action.action_layout_id:
+                        raise ValueError("Semantic GreenWAM action loss requires action_layout_id")
+                    body_part_ids = [space.body_part_ids(
+                        contract_ids.reshape(-1).expand(pred.shape[0]),
+                        layout_ids=layout_ids.reshape(-1).expand(pred.shape[0]),
+                    ) for contract_ids, layout_ids, pred in zip(
+                        data_batch_packed.action.action_contract_id,
+                        data_batch_packed.action.action_layout_id,
+                        out_net["preds_action"],
+                        strict=True,
+                    )]
+                    reduction = getattr(self.config, "action_loss_reduction", "mean_over_valid_body_parts_v1")
+                    if reduction == "mean_over_valid_coordinates_v1":
+                        body_part_ids = None  # one equal weight per valid coordinate instead of per body part
+                    elif reduction != "mean_over_valid_body_parts_v1":
+                        raise ValueError(f"Unknown action_loss_reduction {reduction!r}")
+                    # Unresolved channels stay in the transport container but never enter shared
+                    # supervision; drop them from the loss validity mask.
+                    action_valid_mask_for_loss = [
+                        restrict_action_valid_mask_to_shared(
+                            valid,
+                            # Contract ids may be dense per frame while the layout id is one scalar per sample;
+                            # both are constant within a sample, so one [1,128] row serves the whole window.
+                            space.shared_transport_mask(contract_ids.reshape(-1)[:1], layout_ids=layout_ids.reshape(-1)[:1]),
+                            pred.shape[-1],
+                        )
+                        for valid, contract_ids, layout_ids, pred in zip(
+                            data_batch_packed.action.action_valid_mask
+                            if data_batch_packed.action.action_valid_mask is not None
+                            else [None] * len(out_net["preds_action"]),
+                            data_batch_packed.action.action_contract_id,
+                            data_batch_packed.action.action_layout_id,
+                            out_net["preds_action"],
+                            strict=True,
+                        )
+                    ]
+                fm_loss_action, _ = compute_flow_matching_loss(
                     pred=out_net["preds_action"],
                     target=gen_data_noised.vt_target_action,
                     condition_mask=data_batch_packed.action.condition_mask,
                     timesteps=ts_action,
-                    has_valid_tokens=has_noisy_tokens(data_batch_packed.action),
+                    has_valid_tokens=action_has_valid_tokens,
                     rectified_flow=self.rectified_flow_action,
+                    tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                     raw_action_dim=data_batch_packed.action.raw_action_dim,
+                    action_valid_mask=action_valid_mask_for_loss,
                     normalize_by_active=normalize_by_active,
+                    action_slot_stats=action_slot_stats,
+                    action_body_part_ids=body_part_ids,
                 )
 
                 # Yihuai: In case the video loss is too large (1.5) and covers the action loss (0.05), we scale up the action loss to match the video loss to improve action precision.
                 total_loss += fm_loss_action * rf_cfg.action_loss_weight
                 losses_dict["flow_matching_loss_action"] = fm_loss_action
+                losses_dict[ACTION_SLOT_SAMPLE_LOSS_KEY] = action_slot_stats.sample_loss
+                losses_dict[ACTION_SLOT_SAMPLE_COUNT_KEY] = action_slot_stats.sample_count
             else:
                 # No action data in this batch. Connect the network's dummy preds_action
                 # to the loss so action-specific params
-                # (llm2action, action2llm, action_modality_embed) stay in the backward
-                # graph. Without this, FSDP reduce-scatter / DDP all-reduce will hang
-                # when other ranks do have action data.
+                # (llm2action, action2llm, and action_modality_embed when enabled)
+                # stay in the backward graph. Without this, FSDP reduce-scatter /
+                # DDP all-reduce will hang when other ranks do have action data.
                 dummy_loss = 0.0 * sum(p.sum() for p in out_net["preds_action"])
                 total_loss += dummy_loss
                 losses_dict["flow_matching_loss_action"] = dummy_loss
@@ -1141,13 +1877,14 @@ class OmniMoTModel(ImaginaireModel):
                 )
                 assert gen_data_noised.vt_target_sound is not None, "Sound targets required when sound_gen is True"
                 # Sound preds/targets are (C, T); condition_mask is (T, 1) — transpose to (1, T) for broadcasting
-                fm_loss_sound, _ = self._compute_flow_matching_loss(
+                fm_loss_sound, _ = compute_flow_matching_loss(
                     pred=out_net["preds_sound"],
                     target=gen_data_noised.vt_target_sound,
                     condition_mask=[m.T for m in data_batch_packed.sound.condition_mask],
                     timesteps=ts_sound,
                     has_valid_tokens=has_noisy_tokens(data_batch_packed.sound),
                     rectified_flow=self.rectified_flow_sound,
+                    tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                     normalize_by_active=normalize_by_active,
                 )
                 loss_scale = rf_cfg.sound_loss_scale if rf_cfg.sound_loss_scale is not None else rf_cfg.loss_scale
@@ -1155,16 +1892,31 @@ class OmniMoTModel(ImaginaireModel):
                 losses_dict["flow_matching_loss_sound"] = fm_loss_sound
             else:
                 # No sound data in this batch. Connect the network's dummy preds_sound
-                # to the loss so sound-specific params (sound2llm, llm2sound,
-                # sound_modality_embed) stay in the backward graph. Without this,
-                # FSDP gradient reduce hangs when other ranks do have sound data.
+                # to the loss so enabled sound-specific parameters stay in the backward
+                # graph. Without this, FSDP gradient reduce hangs when other ranks do
+                # have sound data.
                 dummy_loss = 0.0 * sum(p.sum() for p in out_net["preds_sound"])
                 total_loss += dummy_loss
                 losses_dict["flow_matching_loss_sound"] = dummy_loss
         else:
             losses_dict["flow_matching_loss_sound"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
 
+        # Sample-level (vs rank-level) loss averaging. Scale the whole batch loss
+        # (vision + accompanying action/audio for video batches) by one factor so every
+        # image / video sample contributes equally across the data-parallel group. Applied
+        # here — after all flow-matching terms, before load balancing — so the video/action/
+        # audio balance is preserved and the auxiliary load-balancing losses stay unscaled.
+        if rf_cfg.sample_level_loss_averaging and self.config.vision_gen:
+            num_samples = len(out_net["preds_vision"])
+            sample_level_scale = self._sample_level_loss_scale(
+                is_image_batch=is_image_batch,
+                num_samples=num_samples,
+                device=self.tensor_kwargs_fp32["device"],
+            )
+            total_loss = total_loss * sample_level_scale.to(dtype=total_loss.dtype)
+
         # 2. Load balancing auxiliary losses
+        device_mesh, context_parallel_mesh = self._get_load_balancing_loss_meshes()
         for load_balancing_type in ["und", "gen"]:
             lbl_metadata = out_net.get(f"lbl_metadata_{load_balancing_type}", None)
             if lbl_metadata is None:
@@ -1173,7 +1925,8 @@ class OmniMoTModel(ImaginaireModel):
                 lbl_metadata,
                 coeff=getattr(self.config.lbl, f"coeff_{load_balancing_type}"),
                 method=self.config.lbl.method,
-                device_mesh=self.parallel_dims.dp_mesh if self.parallel_dims else None,
+                device_mesh=device_mesh,
+                context_parallel_mesh=context_parallel_mesh,
             )
             if load_balancing_loss is not None:
                 total_loss += load_balancing_loss
@@ -1182,16 +1935,34 @@ class OmniMoTModel(ImaginaireModel):
         return total_loss, losses_dict
 
     def _update_train_stats(self, data_batch: dict[str, torch.Tensor]) -> None:
+        if not isinstance(self.net, WeightTrainingStat):
+            return
+
         is_image = self.is_image_batch(data_batch)
-        input_key = self.input_image_key if is_image else self.input_video_key
-        if isinstance(self.net, WeightTrainingStat):
-            val = data_batch[input_key]
+        if self._has_vision_stream(data_batch):
+            input_key = self.input_image_key if is_image else self.input_video_key
+            value = data_batch[input_key]
             # For image editing data_batch[input_key] is a list-of-lists, not a tensor.
-            sample_count = len(val) if isinstance(val, list) else val.shape[0]
-            if is_image:
-                self.net.accum_image_sample_counter += sample_count
-            else:
-                self.net.accum_video_sample_counter += sample_count
+            sample_count = len(value) if isinstance(value, list) else value.shape[0]
+        else:
+            # The LiDAR-only stream still contributes samples on the video clock. Prefer
+            # per-sample item counts after encoding has flattened the LiDAR item list.
+            lidar_counts = data_batch.get("num_lidar_items_per_sample")
+            sample_count = len(lidar_counts) if lidar_counts is not None else len(data_batch["lidar"])
+
+        if is_image:
+            self.net.accum_image_sample_counter += sample_count
+        else:
+            self.net.accum_video_sample_counter += sample_count
+
+    def _update_train_stats_from_processed_batch(self, gen_data_clean: GenerationDataClean) -> None:
+        """Update rank-zero sample counters from the CP-shared processed payload."""
+        if not isinstance(self.net, WeightTrainingStat):
+            return
+        if gen_data_clean.is_image_batch:
+            self.net.accum_image_sample_counter += gen_data_clean.batch_size
+        else:
+            self.net.accum_video_sample_counter += gen_data_clean.batch_size
 
     def _load_and_tokenize_text_data(
         self,
@@ -1254,8 +2025,10 @@ class OmniMoTModel(ImaginaireModel):
         # Continuous RF implementation
         max_timestep = rectified_flow.noise_scheduler.config.num_train_timesteps
 
-        # Get shift value(s) - support both int and dict-based resolution lookup
-        shift_config = self.config.rectified_flow_training_config.shift
+        # Get shift value(s) - images can override the shared/video shift.
+        rf_config = self.config.rectified_flow_training_config
+        shift_image = getattr(rf_config, "shift_image", None)
+        shift_config = shift_image if is_image_batch and shift_image is not None else rf_config.shift
         if isinstance(shift_config, int):
             # Int-based shift: use directly for all samples
             shifts = torch.full((batch_size,), shift_config, dtype=torch.float32)
@@ -1265,11 +2038,20 @@ class OmniMoTModel(ImaginaireModel):
             shift_dict = dict(shift_config)
             if not is_image_batch and "dynamic_shift_base_num_tokens_video" in shift_dict:
                 # Dynamic shift based on token count
-                assert num_tokens is not None and len(num_tokens) == batch_size
+                if num_tokens is None or len(num_tokens) != batch_size:
+                    raise ValueError(
+                        "dynamic_shift_base_num_tokens_video requires one vision token count per sample; "
+                        f"got {0 if num_tokens is None else len(num_tokens)} counts for batch size {batch_size}. "
+                        "A vision-less LiDAR batch cannot use a vision-token-based dynamic shift."
+                    )
                 base_num_tokens = shift_dict["dynamic_shift_base_num_tokens_video"]
                 shifts = torch.sqrt(torch.tensor(num_tokens, dtype=torch.float32) / base_num_tokens)
             elif is_image_batch and "dynamic_shift_base_num_tokens_image" in shift_dict:
-                assert num_tokens is not None and len(num_tokens) == batch_size
+                if num_tokens is None or len(num_tokens) != batch_size:
+                    raise ValueError(
+                        "dynamic_shift_base_num_tokens_image requires one vision token count per sample; "
+                        f"got {0 if num_tokens is None else len(num_tokens)} counts for batch size {batch_size}."
+                    )
                 base_num_tokens = shift_dict["dynamic_shift_base_num_tokens_image"]
                 shifts = torch.sqrt(torch.tensor(num_tokens, dtype=torch.float32) / base_num_tokens)
             else:
@@ -1402,6 +2184,7 @@ class OmniMoTModel(ImaginaireModel):
         sigmas: torch.Tensor,
         sigmas_action: torch.Tensor | None = None,
         sigmas_sound: torch.Tensor | None = None,
+        sigmas_lidar: torch.Tensor | None = None,
         iteration: int | None = None,
     ) -> GenerationDataNoised:
         """
@@ -1422,6 +2205,9 @@ class OmniMoTModel(ImaginaireModel):
                 ``independent_action_schedule=True``.
             sigmas_sound: Optional dense sound sigma tensor matching ``packed_sequence.sound.*``.
                 When None, sound reuses ``sigmas``.
+            sigmas_lidar: ``[n_lidar_items, 1]`` sigma per LiDAR item, required when the batch
+                carries LiDAR. Rows are the owning sample's vision sigma so both sensors are
+                noised at the same point on the flow.
 
         Returns:
             GenerationDataNoised: A dataclass containing the noise, noisy data (xt), and velocity field (vt).
@@ -1448,18 +2234,14 @@ class OmniMoTModel(ImaginaireModel):
         epsilon_vision = [
             torch.randn(x0_vision_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_vision_i in x0_vision
         ]  # list of [C,T,H,W]
-        # Under CP, every rank holds the same x0 (broadcast in trainer._fetch_and_broadcast_data)
-        # but each samples its own ε from a rank-divergent RNG. Broadcasting from CP rank 0 makes
-        # ε (and therefore xt) identical across the CP group so the seq-sharded packed sequence
-        # is consistent. No-op when CP is disabled.
+        # Under CP, every rank holds the same x0 (the post-tokenizer payload is broadcast
+        # round-robin above) but each samples its own ε from a rank-divergent RNG. Broadcasting
+        # from CP rank 0 makes ε (and therefore xt) identical across the CP group so the
+        # seq-sharded packed sequence is consistent. No-op when CP is disabled.
         context_parallel_broadcast_tensor_list(epsilon_vision, self.parallel_dims)
 
         # Derive noisy mask (1 for noised, 0 for clean) for sigmas computation
-        assert packed_sequence.vision is not None, "Packed vision data required for noise scheduling"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for noise scheduling"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for noise scheduling"
-        )
+        condition_mask_vision = _vision_condition_masks(packed_sequence)
 
         # Compute sigmas per vision item (supports variable shapes).
         # For image editing, x0_tokens_vision is a flat list with multiple items per sample
@@ -1468,8 +2250,8 @@ class OmniMoTModel(ImaginaireModel):
         # view(-1,1,1)[:T_latent]: for base/TF sigmas[i] is (1,), view gives (1,1,1) and the slice is a no-op;
         # for DF sigmas[i] is (T_max,) — one sigma per video latent frame — view gives (T_max,1,1)
         # and [:T_latent] slices to (T_latent,1,1) matching the per-item latent frame count.
-        num_vision_items = len(packed_sequence.vision.condition_mask)
-        noisy_mask_vision = [1.0 - cond_mask for cond_mask in packed_sequence.vision.condition_mask]
+        num_vision_items = len(condition_mask_vision)
+        noisy_mask_vision = [1.0 - cond_mask for cond_mask in condition_mask_vision]
         sigmas_vision = [
             sigmas[i].view(-1, 1, 1)[: x0_vision[i].shape[2]] * noisy_mask_vision[i] for i in range(num_vision_items)
         ]
@@ -1483,6 +2265,31 @@ class OmniMoTModel(ImaginaireModel):
         xt_vision = [
             xt_vision_i.to(**self.tensor_kwargs) for xt_vision_i in xt_vision
         ]  # list of [C,T,H,W]; to make tensor compatible with the precision of the model
+
+        # LiDAR: same rectified flow as video, on its own grid latents.
+        x0_lidar = gen_data_clean.x0_tokens_lidar  # list of [C,T,H,W]
+        if x0_lidar is not None and len(x0_lidar) > 0:
+            assert packed_sequence.lidar is not None, "Packed LiDAR data required when LiDAR tokens exist"
+            assert isinstance(packed_sequence.lidar.condition_mask, list), (
+                "LiDAR condition mask must be a list of tensors for noise scheduling"
+            )
+            assert sigmas_lidar is not None, "sigmas_lidar required when LiDAR tokens exist"
+            epsilon_lidar = [
+                torch.randn(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_lidar
+            ]  # list of [C,T,H,W]
+            context_parallel_broadcast_tensor_list(epsilon_lidar, self.parallel_dims)
+            # sigmas_lidar[i] is (1,) → view (1,1,1), broadcast against condition_mask [T,1,1].
+            sigmas_lidar_list = [
+                sigmas_lidar[i].view(-1, 1, 1) * (1.0 - packed_sequence.lidar.condition_mask[i])
+                for i in range(len(x0_lidar))
+            ]  # list of [T,1,1]
+            xt_lidar, vt_lidar = self.rectified_flow_video.get_interpolation(epsilon_lidar, x0_lidar, sigmas_lidar_list)
+            xt_lidar = [xt_i.to(**self.tensor_kwargs) for xt_i in xt_lidar]  # list of [C,T,H,W]
+        else:
+            epsilon_lidar = None
+            sigmas_lidar_list = None
+            xt_lidar = None
+            vt_lidar = None
 
         # Action (x0_tokens_action is already a dense list with no None entries).
         # Gate on action_gen: the dataset may emit action tensors for models that
@@ -1538,6 +2345,9 @@ class OmniMoTModel(ImaginaireModel):
             for i in range(len(xt_action)):
                 if gen_data_clean.raw_action_dim is not None and gen_data_clean.raw_action_dim[i] is not None:
                     xt_action[i][:, gen_data_clean.raw_action_dim[i] :] = 0
+                if gen_data_clean.action_valid_mask is not None and gen_data_clean.action_valid_mask[i] is not None:
+                    valid_mask = gen_data_clean.action_valid_mask[i].to(device=xt_action[i].device)
+                    xt_action[i] = mask_action_values(xt_action[i], valid_mask)
 
         else:
             epsilon_action = None
@@ -1583,12 +2393,18 @@ class OmniMoTModel(ImaginaireModel):
             xt_tokens_vision=xt_vision,
             vt_target_vision=vt_vision,
             sigmas_vision=sigmas_vision,
+            # lidar
+            epsilon_lidar=epsilon_lidar,
+            xt_tokens_lidar=xt_lidar,
+            vt_target_lidar=vt_lidar,
+            sigmas_lidar=sigmas_lidar_list,
             # action
             epsilon_action=epsilon_action,
             xt_tokens_action=xt_action,
             vt_target_action=vt_action,
             sigmas_action=sigmas_action,
             raw_action_dim=gen_data_clean.raw_action_dim,
+            action_valid_mask=gen_data_clean.action_valid_mask,
             # sound
             epsilon_sound=epsilon_sound,
             xt_tokens_sound=xt_sound,
@@ -1606,6 +2422,8 @@ class OmniMoTModel(ImaginaireModel):
         """Replace packed clean tokens with noised tokens."""
         if packed_sequence.vision is not None:
             packed_sequence.vision.tokens = gen_data_noised.xt_tokens_vision
+        if packed_sequence.lidar is not None and gen_data_noised.xt_tokens_lidar is not None:
+            packed_sequence.lidar.tokens = gen_data_noised.xt_tokens_lidar
         if packed_sequence.action is not None and gen_data_noised.xt_tokens_action is not None:
             action_all_conditioning = all(
                 torch.all(condition_mask == 1).item() for condition_mask in packed_sequence.action.condition_mask
@@ -1665,6 +2483,7 @@ class OmniMoTModel(ImaginaireModel):
         list[torch.Tensor],
         list[torch.Tensor],
         list[torch.Tensor],
+        bool,
     ]:
         """
         Prepare all data needed for inference sampling.
@@ -1676,7 +2495,7 @@ class OmniMoTModel(ImaginaireModel):
         3. Tokenizes text (conditional and unconditional for CFG)
         4. Builds a packed sequence to fetch conditioning masks
         5. Initializes noise with conditioning applied (as lists for variable shapes)
-        6. If action_gen is True, concatenates action noise with vision noise
+        6. Concatenates action noise with vision noise when the plan has action targets
 
         Args:
             data_batch: Raw data batch from dataloader.
@@ -1695,6 +2514,11 @@ class OmniMoTModel(ImaginaireModel):
                   in the same order as initial_noise
                 - condition_mask: List of masks flattened in the same order as
                   initial_noise, where 1 keeps condition_reference values fixed
+                - has_noisy_actions: True when the packed sequence marks action
+                  tokens as denoising targets. Determines whether the flattened
+                  noise layout is [vision | action | sound] or [vision | sound];
+                  callers must thread it to _get_velocity so both sides split the
+                  flat state identically.
         """
         # 1. Build sequence plans (same as training)
         sequence_plans = build_sequence_plans_from_data_batch(
@@ -1706,11 +2530,22 @@ class OmniMoTModel(ImaginaireModel):
         # 2. Get data and condition (same as training)
         # This encodes vision to x0_tokens. Pass each sample's vision conditioning
         # frame indexes so a causal tokenizer can skip encoding pixel frames that only
-        # feed generated (non-conditioned) latent positions (e.g. policy /
+        # feed generated (non-conditioned) latent positions (e.g. WAM /
         # forward-dynamics condition latent frame 0 only, so only the first pixel frame
         # is encoded instead of the whole clip).
         vision_condition_indexes = [plan.condition_frame_indexes_vision for plan in sequence_plans]
-        gen_data_clean = self.get_data_and_condition(data_batch, vision_condition_indexes=vision_condition_indexes)
+        per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
+        gen_data_clean = self.get_data_and_condition(
+            data_batch,
+            vision_condition_indexes=vision_condition_indexes,
+            retain_raw_state_vision=not per_camera_vae_encoding,
+        )
+        if gen_data_clean.num_views_per_vision_item is None:
+            gen_data_clean.num_views_per_vision_item = self._get_explicit_single_view_metadata(
+                data_batch,
+                gen_data_clean.num_vision_items_per_sample,
+                gen_data_clean.batch_size,
+            )
 
         num_items_per_sample = gen_data_clean.num_vision_items_per_sample  # None for standard T2I/T2V
 
@@ -1728,11 +2563,7 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         # 5. Initialize vision noise with conditioning
-        assert packed_sequence.vision is not None, "Packed vision data required for inference noise"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for inference noise"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for inference noise"
-        )
+        condition_mask_vision = _vision_condition_masks(packed_sequence)
         assert gen_data_clean.x0_tokens_vision is not None, "Vision data required for inference noise"
         n_sample = (
             len(gen_data_clean.x0_tokens_vision)
@@ -1759,9 +2590,10 @@ class OmniMoTModel(ImaginaireModel):
         # get_data_and_condition). The cast to model dtype happens inside velocity_fn.
         noise_vision_list: list[torch.Tensor] = []
         for i, (x0_token, cond_mask) in enumerate(
-            zip(gen_data_clean.x0_tokens_vision, packed_sequence.vision.condition_mask, strict=True)
+            zip(gen_data_clean.x0_tokens_vision, condition_mask_vision, strict=True)
         ):
-            pure_noise_i = misc.arch_invariant_rand(
+            pure_noise_i = _initial_noise(
+                getattr(self.config, "inference_noise_source", "numpy"),  # configs written before the switch
                 tuple(x0_token.shape),
                 self.tensor_kwargs_fp32["dtype"],
                 self.tensor_kwargs_fp32["device"],
@@ -1770,35 +2602,77 @@ class OmniMoTModel(ImaginaireModel):
             noise_i = cond_mask * x0_token + (1.0 - cond_mask) * pure_noise_i  # [C,T,H,W]
             noise_vision_list.append(noise_i)
 
+        # 5b. Initialize LiDAR noise the same way, from its own stream's condition masks.
+        noise_lidar_list: list[torch.Tensor] | None = None
+        if gen_data_clean.x0_tokens_lidar is not None:
+            assert packed_sequence.lidar is not None, "Packed LiDAR data required when the batch carries LiDAR"
+            assert isinstance(packed_sequence.lidar.condition_mask, list), "LiDAR condition mask required"
+            lidar_counts = gen_data_clean.num_lidar_items_per_sample or [1] * n_sample
+            seed_lidar = [seed[sample_idx] for sample_idx, count in enumerate(lidar_counts) for _ in range(count)]
+            noise_lidar_list = []
+            for i, (x0_token, cond_mask) in enumerate(
+                zip(gen_data_clean.x0_tokens_lidar, packed_sequence.lidar.condition_mask, strict=True)
+            ):
+                pure_noise_i = misc.arch_invariant_rand(
+                    tuple(x0_token.shape),
+                    self.tensor_kwargs_fp32["dtype"],
+                    self.tensor_kwargs_fp32["device"],
+                    seed_lidar[i],
+                )  # [C,T,H,W]
+                noise_lidar_list.append(cond_mask * x0_token + (1.0 - cond_mask) * pure_noise_i)  # [C,T,H,W]
+
         # 6. Initialize action noise if action_gen is True
         has_action = self.config.action_gen and any(plan.has_action for plan in sequence_plans)
+        # Actions are denoising targets only when the packer marked action tokens
+        # as noisy/supervised (WAM / inverse dynamics leave predicted steps
+        # un-conditioned). Forward-dynamics plans and the temporal-causal packer
+        # emit all-conditioning action tokens (actions are pure inputs), so there
+        # is nothing to denoise — the network's _decode_action returns dummy zero
+        # predictions in that case (same has_noisy_tokens predicate).
+        has_noisy_actions = has_action and has_noisy_tokens(packed_sequence.action)
         noise_action_list: list[torch.Tensor] | None = None
 
-        if has_action:
+        if has_noisy_actions:
             assert gen_data_clean.x0_tokens_action is not None, "Action data required when sequence plan has action"
-            assert packed_sequence.action is not None, "Packed action data required when action_gen is True"
-            assert packed_sequence.action.condition_mask is not None, "Action condition mask required"
-            assert isinstance(packed_sequence.action.condition_mask, list), (
-                "Action condition mask must be a list of tensors for inference noise"
-            )
-
             # Generate action noise per sample (x0_tokens_action is already dense, no None entries)
             noise_action_list = []
             for i, (x0_action, cond_mask_action) in enumerate(
                 zip(gen_data_clean.x0_tokens_action, packed_sequence.action.condition_mask, strict=True)
             ):
-                pure_noise_action_i = misc.arch_invariant_rand(
-                    tuple(x0_action.shape),
-                    self.tensor_kwargs["dtype"],
-                    self.tensor_kwargs["device"],
-                    seed_dict["action"][i],  # Different seed per sample for diversity
-                )  # [T,action_dim]
-                noise_action_i = (
-                    cond_mask_action * x0_action.to(**self.tensor_kwargs)
-                    + (1.0 - cond_mask_action) * pure_noise_action_i
-                )
+                # Mirror the vision branch: keep the action noise and the conditioning blend in fp32
+                # so the sampler accumulates in full precision and inference matches the fp32 flow
+                # interpolation used in training. The cast to model dtype happens inside velocity_fn
+                # (at the action encoder boundary in ``_encode_action``).
+                if getattr(self.config, "inference_noise_source", "numpy") == "torch_cuda":
+                    # The fixed-layout runs drew action noise in the model dtype and blended it with the mask as packed.
+                    pure_noise_action_i = _initial_noise(
+                        "torch_cuda", tuple(x0_action.shape), self.tensor_kwargs["dtype"],
+                        self.tensor_kwargs["device"], seed_dict["action"][i],
+                    )  # [T,action_dim]
+                    noise_action_i = (
+                        cond_mask_action * x0_action.to(**self.tensor_kwargs)
+                        + (1.0 - cond_mask_action) * pure_noise_action_i
+                    )  # [T,action_dim]
+                    # Those runs also left the noise on the padded and invalid channels (no masking below).
+                    noise_action_list.append(noise_action_i)
+                    continue
+                else:
+                    pure_noise_action_i = misc.arch_invariant_rand(
+                        tuple(x0_action.shape),
+                        self.tensor_kwargs_fp32["dtype"],
+                        self.tensor_kwargs_fp32["device"],
+                        seed_dict["action"][i],  # Different seed per sample for diversity
+                    )  # [T,action_dim]
+                    cond_mask_action_fp32 = cond_mask_action.to(**self.tensor_kwargs_fp32)  # [T,1]
+                    noise_action_i = (
+                        cond_mask_action_fp32 * x0_action.to(**self.tensor_kwargs_fp32)
+                        + (1.0 - cond_mask_action_fp32) * pure_noise_action_i
+                    )  # [T,action_dim]
                 if gen_data_clean.raw_action_dim is not None and gen_data_clean.raw_action_dim[i] is not None:
                     noise_action_i[:, gen_data_clean.raw_action_dim[i] :] = 0
+                if gen_data_clean.action_valid_mask is not None and gen_data_clean.action_valid_mask[i] is not None:
+                    valid_mask = gen_data_clean.action_valid_mask[i].to(device=noise_action_i.device)
+                    noise_action_i = mask_action_values(noise_action_i, valid_mask)
                 noise_action_list.append(noise_action_i)
 
         # 7. Initialize sound noise if sound_gen is True
@@ -1817,27 +2691,34 @@ class OmniMoTModel(ImaginaireModel):
             for i, (x0_sound, cond_mask_sound) in enumerate(
                 zip(gen_data_clean.x0_tokens_sound, packed_sequence.sound.condition_mask, strict=True)
             ):
+                # Mirror the vision branch: keep the sound noise and the conditioning blend in fp32
+                # so the sampler accumulates in full precision and inference matches the fp32 flow
+                # interpolation used in training (``_add_noise_to_input`` noises sound in fp32).
+                # The cast to model dtype happens inside velocity_fn.
                 pure_noise_sound_i = misc.arch_invariant_rand(
                     tuple(x0_sound.shape),
-                    self.tensor_kwargs["dtype"],
-                    self.tensor_kwargs["device"],
+                    self.tensor_kwargs_fp32["dtype"],
+                    self.tensor_kwargs_fp32["device"],
                     seed_dict["sound"][i],  # Different seed per sample for diversity
                 )  # [sound_channels,T_sound]
                 # cond_mask_sound is (T, 1), x0_sound is (C, T) — transpose mask for broadcasting
+                cond_mask_sound_fp32 = cond_mask_sound.T.to(**self.tensor_kwargs_fp32)  # [1,T_sound]
                 noise_sound_i = (
-                    cond_mask_sound.T * x0_sound.to(**self.tensor_kwargs)
-                    + (1.0 - cond_mask_sound.T) * pure_noise_sound_i
+                    cond_mask_sound_fp32 * x0_sound.to(**self.tensor_kwargs_fp32)
+                    + (1.0 - cond_mask_sound_fp32) * pure_noise_sound_i
                 )  # [sound_channels,T_sound]
                 noise_sound_list.append(noise_sound_i)
 
-        # 8. Concatenate vision, action, and sound noise per sample (flattened)
-        # Order: [vision | action (if present) | sound (if present)]
+        # 8. Concatenate vision, LiDAR, action, and sound noise per sample (flattened)
+        # Order: [vision | lidar (if present) | action (if present) | sound (if present)],
+        # matching the order the packer lays a sample out in.
         # noise_action_list and noise_sound_list are dense (only modality-having samples),
         # so we use separate indexes.
         initial_noise: list[torch.Tensor] = []
         condition_reference: list[torch.Tensor] = []
         condition_mask: list[torch.Tensor] = []
         idx_vision = 0
+        idx_lidar = 0
         idx_action = 0
         idx_sound = 0
 
@@ -1858,6 +2739,20 @@ class OmniMoTModel(ImaginaireModel):
                 condition_mask_parts.append((mask_vision * torch.ones_like(x0_vision)).reshape(-1))  # [N_vision]
                 idx_vision += 1
 
+            if noise_lidar_list is not None and sequence_plans[i].has_lidar:
+                assert packed_sequence.lidar is not None
+                assert gen_data_clean.x0_tokens_lidar is not None
+                lidar_counts = gen_data_clean.num_lidar_items_per_sample
+                for _ in range(lidar_counts[i] if lidar_counts is not None else 1):
+                    parts.append(noise_lidar_list[idx_lidar].reshape(-1))
+                    x0_lidar = gen_data_clean.x0_tokens_lidar[idx_lidar]  # [C,T,H,W]
+                    mask_lidar = packed_sequence.lidar.condition_mask[idx_lidar].to(  # [T,1,1]
+                        dtype=x0_lidar.dtype, device=x0_lidar.device
+                    )
+                    condition_reference_parts.append(x0_lidar.reshape(-1))  # [N_lidar]
+                    condition_mask_parts.append((mask_lidar * torch.ones_like(x0_lidar)).reshape(-1))  # [N_lidar]
+                    idx_lidar += 1
+
             if noise_action_list is not None and sequence_plans[i].has_action:
                 assert packed_sequence.action is not None
                 assert packed_sequence.action.condition_mask is not None
@@ -1870,6 +2765,13 @@ class OmniMoTModel(ImaginaireModel):
                 if gen_data_clean.raw_action_dim is not None and gen_data_clean.raw_action_dim[idx_action] is not None:
                     x0_action = x0_action.clone()  # [T,D]
                     x0_action[:, gen_data_clean.raw_action_dim[idx_action] :] = 0  # [T,D]
+                if (
+                    gen_data_clean.action_valid_mask is not None
+                    and gen_data_clean.action_valid_mask[idx_action] is not None
+                ):
+                    x0_action = x0_action.clone()  # [T,D]
+                    valid_mask = gen_data_clean.action_valid_mask[idx_action].to(device=x0_action.device)
+                    x0_action = mask_action_values(x0_action, valid_mask)
                 mask_action = packed_sequence.action.condition_mask[idx_action].to(  # [T,1]
                     dtype=x0_action.dtype, device=x0_action.device
                 )
@@ -1905,7 +2807,132 @@ class OmniMoTModel(ImaginaireModel):
             initial_noise,
             condition_reference,
             condition_mask,
+            has_noisy_actions,
         )
+
+    def _can_reuse_inference_pack_templates(
+        self,
+        sequence_plans: list[SequencePlan],
+        gen_data_clean: GenerationDataClean,
+    ) -> bool:
+        """Return whether denoising can reuse request-local packed metadata templates."""
+        if gen_data_clean.num_vision_items_per_sample is not None:
+            return False
+        if self.config.video_temporal_causal:
+            return False
+        if self.config.sound_gen and any(plan.has_sound for plan in sequence_plans):
+            return False
+        return True
+
+    def _can_reuse_inference_text_kv(
+        self,
+        sequence_plans: list[SequencePlan],
+        gen_data_clean: GenerationDataClean,
+        *,
+        reuse_pack_templates: bool,
+        has_velocity_postprocess: bool,
+    ) -> bool:
+        """Return rank-local eligibility for request-local text K/V reuse.
+
+        The caller must MIN-reduce this result over every participating FSDP
+        and CFG-parallel group before installing the cache.
+        """
+        if has_velocity_postprocess or not reuse_pack_templates:
+            return False
+        # CFG parallelism and FSDP are safe when the caller synchronizes
+        # eligibility: caches stay rank-local. CP changes the attention layout
+        # and remains excluded pending separate validation.
+        if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+            return False
+        if self.config.joint_attn_implementation != "two_way":
+            return False
+        if self.config.video_temporal_causal:
+            return False
+        if self.config.sound_gen and any(plan.has_sound for plan in sequence_plans):
+            return False
+        if gen_data_clean.batch_size != 1 or len(sequence_plans) != 1:
+            return False
+        if gen_data_clean.num_vision_items_per_sample is not None:
+            return False
+        return True
+
+    def _make_inference_text_kv_cache(self, net: torch.nn.Module | None = None) -> list[UndKVCache]:
+        """Create per-layer request-local text K/V caches for one CFG branch."""
+        target_net = net or self.net
+        return make_inference_text_kv_cache(len(target_net.language_model.model.layers))
+
+    def _copy_timestep_to_template(self, timesteps: torch.Tensor | None, timestep: torch.Tensor) -> None:
+        """Copy the sampler timestep into a packed template without a device-to-host round trip."""
+        if timesteps is None or timesteps.numel() == 0:
+            return
+        timestep_values = timestep.reshape(-1).to(device=timesteps.device, dtype=timesteps.dtype)  # [B_or_1]
+        timestep_value = timestep_values[0]  # []
+        timesteps.copy_(timestep_value.expand_as(timesteps))  # [N_noisy_tokens]
+
+    def _update_inference_pack_template(
+        self,
+        packed_sequence: PackedSequence,
+        noise_x_vision: list[torch.Tensor],
+        noise_x_lidar: list[torch.Tensor] | None,
+        noise_x_action: list[torch.Tensor] | None,
+        noise_x_sound: list[torch.Tensor] | None,
+        timestep: torch.Tensor,
+    ) -> PackedSequence:
+        """Refresh noisy tokens and timesteps in a request-local packed sequence template."""
+        if packed_sequence.vision is not None:
+            packed_sequence.vision.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_vision]  # list[[C,T,H,W]]
+            self._copy_timestep_to_template(packed_sequence.vision.timesteps, timestep)
+
+        if noise_x_lidar is not None:
+            assert packed_sequence.lidar is not None, "packed_sequence.lidar must exist when LiDAR noise is present"
+            packed_sequence.lidar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_lidar]  # list[[C,T,H,W]]
+            self._copy_timestep_to_template(packed_sequence.lidar.timesteps, timestep)
+
+        if noise_x_action is not None:
+            assert packed_sequence.action is not None, "packed_sequence.action must exist when action noise is present"
+            packed_sequence.action.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_action]  # list[[T,D]]
+            self._copy_timestep_to_template(packed_sequence.action.timesteps, timestep)
+
+        if noise_x_sound is not None:
+            assert packed_sequence.sound is not None, "packed_sequence.sound must exist when sound noise is present"
+            packed_sequence.sound.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_sound]  # list[[C_sound,T]]
+            self._copy_timestep_to_template(packed_sequence.sound.timesteps, timestep)
+
+        return packed_sequence
+
+    @staticmethod
+    def _duplicate_gen_data_clean(gd: GenerationDataClean) -> GenerationDataClean:
+        """Return a GenerationDataClean with every per-sample field duplicated.
+
+        Used by ``use_batched_cfg`` to feed (cond + uncond) through one forward
+        of size 2N instead of two sequential forwards of size N. Field handling
+        is generic (driven by the dataclass fields) so it stays correct if
+        GenerationDataClean gains/loses fields: ``batch_size`` is doubled,
+        scalar flags are copied, per-sample lists are concatenated, and batched
+        tensors are duplicated along dim 0. Tensor/list references are reused
+        (the forward path is read-only on these fields) so this is O(N) with no
+        deep copies.
+        """
+
+        def _dup(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return torch.cat([value, value], dim=0)
+            if isinstance(value, list):
+                return value + value
+            return value
+
+        kwargs: dict[str, Any] = {}
+        for field in dataclasses.fields(gd):
+            val = getattr(gd, field.name)
+            if field.name == "batch_size":
+                kwargs[field.name] = val * 2
+            elif field.name == "is_image_batch":
+                kwargs[field.name] = val
+            else:
+                kwargs[field.name] = _dup(val)
+        return GenerationDataClean(**kwargs)
 
     def _get_velocity(
         self,
@@ -1917,6 +2944,9 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans: list[SequencePlan],
         gen_data_clean: GenerationDataClean,
         skip_text_tokens: bool = False,
+        packed_sequence_template: PackedSequence | None = None,
+        memory: MemoryState | None = None,
+        has_noisy_actions: bool,
     ) -> list[torch.Tensor]:
         """
         Compute velocity prediction for a single sampling step.
@@ -1937,6 +2967,12 @@ class OmniMoTModel(ImaginaireModel):
             sequence_plans: Pre-computed sequence plans (from _prepare_inference_data)
             gen_data_clean: Pre-computed clean data (from _prepare_inference_data)
             skip_text_tokens: If True, skip text tokens (for CFG unconditional branch)
+            packed_sequence_template: Optional request-local packed metadata template.
+            memory: Optional request-local text K/V cache state for this CFG branch.
+            has_noisy_actions: Whether actions are denoising targets, i.e. whether
+                noise_x was laid out as [vision | action | sound]. Must be the
+                packer-derived value from _prepare_inference_data so both sides
+                split the flat state identically.
 
         Returns:
             Stacked flattened velocity tensors (one per sample), each containing
@@ -1945,16 +2981,24 @@ class OmniMoTModel(ImaginaireModel):
         n_samples = len(noise_x)
         is_image_batch = gen_data_clean.is_image_batch
         has_action = self.config.action_gen and any(plan.has_action for plan in sequence_plans)
+        if has_noisy_actions and not has_action:
+            raise ValueError("has_noisy_actions=True requires an action-bearing sequence")
         num_items = gen_data_clean.num_vision_items_per_sample  # None for standard T2I/T2V
         has_sound = self.config.sound_gen and any(plan.has_sound for plan in sequence_plans)
 
-        # Split flattened noise_x into vision, action, and sound parts per sample
-        # Order must match _prepare_inference_data: [vision | action (if present) | sound (if present)]
+        has_lidar = gen_data_clean.x0_tokens_lidar is not None
+        num_lidar_items = gen_data_clean.num_lidar_items_per_sample
+
+        # Split flattened noise_x into vision, LiDAR, action, and sound parts per sample
+        # Order must match _prepare_inference_data:
+        # [vision | lidar (if present) | action (if present) | sound (if present)]
         noise_x_vision: list[torch.Tensor] = []
-        noise_x_action: list[torch.Tensor] | None = [] if has_action else None
+        noise_x_lidar: list[torch.Tensor] | None = [] if has_lidar else None
+        noise_x_action: list[torch.Tensor] | None = [] if has_noisy_actions else None
         noise_x_sound: list[torch.Tensor] | None = [] if has_sound else None
 
         vision_offset = 0  # tracks position in the flat x0_tokens_vision list
+        lidar_offset = 0  # tracks position in the flat x0_tokens_lidar list
         idx_action = 0
         idx_sound = 0
         for i in range(n_samples):
@@ -1968,7 +3012,16 @@ class OmniMoTModel(ImaginaireModel):
                 offset += vision_dim
             vision_offset += n_vis
 
-            if has_action and noise_x_action is not None:
+            if noise_x_lidar is not None and sequence_plans[i].has_lidar:
+                n_lidar = num_lidar_items[i] if num_lidar_items is not None else 1
+                for j in range(n_lidar):
+                    lidar_shape = gen_data_clean.x0_tokens_lidar[lidar_offset + j].shape
+                    lidar_dim = int(torch.prod(torch.tensor(lidar_shape)))
+                    noise_x_lidar.append(noise_x[i][offset : offset + lidar_dim].reshape(lidar_shape))
+                    offset += lidar_dim
+                lidar_offset += n_lidar
+
+            if has_noisy_actions and noise_x_action is not None:
                 assert gen_data_clean.x0_tokens_action is not None
                 action_shape = gen_data_clean.x0_tokens_action[idx_action].shape
                 action_dim = int(torch.prod(torch.tensor(action_shape)))
@@ -1987,6 +3040,14 @@ class OmniMoTModel(ImaginaireModel):
                 offset += sound_dim
                 idx_sound += 1
 
+        if has_action:
+            if has_noisy_actions:
+                x0_action_tokens = noise_x_action
+            else:
+                x0_action_tokens = gen_data_clean.x0_tokens_action
+        else:
+            x0_action_tokens = None
+
         gen_data_for_packing = GenerationDataClean(
             batch_size=n_samples,
             is_image_batch=is_image_batch,
@@ -1996,15 +3057,24 @@ class OmniMoTModel(ImaginaireModel):
             temporal_positions_vision=gen_data_clean.temporal_positions_vision,
             # Action fields
             raw_state_action=gen_data_clean.raw_state_action if has_action else None,
-            x0_tokens_action=noise_x_action if has_action else None,
+            x0_tokens_action=x0_action_tokens,
             action_domain_id=gen_data_clean.action_domain_id if has_action else None,
+            action_contract_id=gen_data_clean.action_contract_id if has_action else None,
+            action_layout_id=gen_data_clean.action_layout_id if has_action else None,
             fps_action=gen_data_clean.fps_action if has_action else None,
             raw_action_dim=gen_data_clean.raw_action_dim if has_action else None,
+            action_valid_mask=gen_data_clean.action_valid_mask if has_action else None,
             # Sound fields
             raw_state_sound=gen_data_clean.raw_state_sound if has_sound else None,
             x0_tokens_sound=noise_x_sound if has_sound else None,
             fps_sound=gen_data_clean.fps_sound if has_sound else None,
             num_vision_items_per_sample=num_items,
+            num_views_per_vision_item=gen_data_clean.num_views_per_vision_item,
+            # LiDAR fields
+            raw_state_lidar=gen_data_clean.raw_state_lidar,
+            x0_tokens_lidar=noise_x_lidar if has_lidar else None,
+            fps_lidar=gen_data_clean.fps_lidar,
+            num_lidar_items_per_sample=num_lidar_items,
             # Multi-control transfer: carry per-control weights so the packer can
             # populate vision_item_split_lens / control_weights on the packed
             # sequence. Without this, multi_control_two_way_attention never runs
@@ -2012,47 +3082,60 @@ class OmniMoTModel(ImaginaireModel):
             control_weights=gen_data_clean.control_weights,
         )
 
-        packed_sequence = self._pack_input_sequence(
-            sequence_plans,
-            text_tokens,
-            gen_data_for_packing,
-            timestep.cpu(),
-            include_end_of_generation_token=self._derive_include_end_of_generation_token(),
-            skip_text_tokens=skip_text_tokens,
-        )
+        if packed_sequence_template is None:
+            packed_sequence = self._pack_input_sequence(
+                sequence_plans,
+                text_tokens,
+                gen_data_for_packing,
+                timestep.cpu(),
+                include_end_of_generation_token=self._derive_include_end_of_generation_token(),
+                skip_text_tokens=skip_text_tokens,
+            )
 
-        # Set the actual noisy latents (as lists)
-        if packed_sequence.vision is not None:
-            packed_sequence.vision.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_vision]
+            # Set the actual noisy latents (as lists)
+            if packed_sequence.vision is not None:
+                packed_sequence.vision.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_vision]  # list[[C,T,H,W]]
 
-        if has_action and noise_x_action is not None:
-            assert packed_sequence.action is not None, "packed_sequence.action must exist when has_action is True"
-            packed_sequence.action.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_action]
-            packed_sequence.action.domain_id = gen_data_clean.action_domain_id
+            if noise_x_lidar is not None:
+                assert packed_sequence.lidar is not None, "packed_sequence.lidar must exist when the batch has LiDAR"
+                packed_sequence.lidar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_lidar]  # list[[C,T,H,W]]
 
-        if has_sound and noise_x_sound is not None:
-            assert packed_sequence.sound is not None, "packed_sequence.sound must exist when has_sound is True"
-            packed_sequence.sound.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_sound]
+            if has_noisy_actions and noise_x_action is not None:
+                assert packed_sequence.action is not None, "packed_sequence.action must exist when has_action is True"
+                packed_sequence.action.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_action]  # list[[T,D]]
+                packed_sequence.action.domain_id = gen_data_clean.action_domain_id
+                packed_sequence.action.action_contract_id = gen_data_clean.action_contract_id or []
 
-        packed_sequence.to_cuda()
+            if has_sound and noise_x_sound is not None:
+                assert packed_sequence.sound is not None, "packed_sequence.sound must exist when has_sound is True"
+                packed_sequence.sound.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_sound]  # list[[C_sound,T]]
+
+            packed_sequence.to_cuda()
+        else:
+            packed_sequence = self._update_inference_pack_template(
+                packed_sequence_template,
+                noise_x_vision,
+                noise_x_lidar,
+                noise_x_action,
+                noise_x_sound,
+                timestep,
+            )
 
         # --- Network forward ---
         out = self.denoise(
             net=net,
             data_batch_packed=packed_sequence,
+            memory=memory,
         )
 
         # --- Apply velocity masks ---
         # Zero out velocity for conditioned parts (they don't change during sampling)
-        assert packed_sequence.vision is not None, "packed_sequence.vision must exist for velocity masking"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for masking"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for masking"
-        )
         # Compute noisy_mask per sample (supports variable shapes)
-        noisy_mask_vision = [1.0 - cond_mask for cond_mask in packed_sequence.vision.condition_mask]
+        noisy_mask_vision = [1.0 - cond_mask for cond_mask in _vision_condition_masks(packed_sequence)]
 
-        # Apply velocity mask per element - check if each sample has noisy tokens
+        # Apply velocity mask per element - check if each sample has noisy tokens. A batch with
+        # no camera stream has no mask to pair with the network's zero-weighted vision
+        # prediction, so the zip stops immediately and leaves the velocity list empty.
         velocity_vision: list[torch.Tensor] = []
         for i, (pred, noisy_mask) in enumerate(zip(out["preds_vision"], noisy_mask_vision)):
             # pred: [C,T,H,W], noisy_mask: [T,1,1]
@@ -2064,10 +3147,22 @@ class OmniMoTModel(ImaginaireModel):
                 # All tokens are conditioned - velocity should be zero
                 velocity_vision.append(torch.zeros_like(pred))  # [C,T,H,W]
 
+        # Handle LiDAR velocity
+        velocity_lidar: list[torch.Tensor] | None = None
+        if has_lidar and packed_sequence.lidar is not None and isinstance(packed_sequence.lidar.condition_mask, list):
+            velocity_lidar = []
+            for pred, cond_mask in zip(out["preds_lidar"], packed_sequence.lidar.condition_mask, strict=True):
+                # pred: [C,T,H,W], cond_mask: [T,1,1]
+                noisy_mask = 1.0 - cond_mask
+                if noisy_mask.sum() > 0:
+                    velocity_lidar.append(pred * noisy_mask.to(dtype=pred.dtype, device=pred.device))  # [C,T,H,W]
+                else:
+                    velocity_lidar.append(torch.zeros_like(pred))  # [C,T,H,W]
+
         # Handle action velocity
         velocity_action: list[torch.Tensor] | None = None
         if (
-            has_action
+            has_noisy_actions
             and packed_sequence.action is not None
             and packed_sequence.action.condition_mask is not None
             and isinstance(packed_sequence.action.condition_mask, list)
@@ -2084,6 +3179,9 @@ class OmniMoTModel(ImaginaireModel):
                     v = torch.zeros_like(pred)  # [T,action_dim]
                 if gen_data_clean.raw_action_dim is not None and gen_data_clean.raw_action_dim[i] is not None:
                     v[:, gen_data_clean.raw_action_dim[i] :] = 0
+                if gen_data_clean.action_valid_mask is not None and gen_data_clean.action_valid_mask[i] is not None:
+                    valid_mask = gen_data_clean.action_valid_mask[i].to(device=v.device)
+                    v = mask_action_values(v, valid_mask)
                 velocity_action.append(v)
 
         # Handle sound velocity
@@ -2108,10 +3206,11 @@ class OmniMoTModel(ImaginaireModel):
                 else:
                     velocity_sound.append(torch.zeros_like(pred))  # [sound_channels,T_sound]
 
-        # Concatenate vision, action, and sound velocities per sample (flattened)
-        # Order must match _prepare_inference_data: [vision | action | sound]
+        # Concatenate vision, LiDAR, action, and sound velocities per sample (flattened)
+        # Order must match _prepare_inference_data: [vision | lidar | action | sound]
         velocity_output: list[torch.Tensor] = []
         vis_offset = 0
+        lidar_out_offset = 0
         idx_action = 0
         idx_sound = 0
         for i in range(n_samples):
@@ -2121,6 +3220,11 @@ class OmniMoTModel(ImaginaireModel):
             for _ in range(n_vis):
                 parts.append(velocity_vision[vis_offset].reshape(-1))
                 vis_offset += 1
+
+            if velocity_lidar is not None and sequence_plans[i].has_lidar:
+                for _ in range(num_lidar_items[i] if num_lidar_items is not None else 1):
+                    parts.append(velocity_lidar[lidar_out_offset].reshape(-1))
+                    lidar_out_offset += 1
 
             if velocity_action is not None and sequence_plans[i].has_action:
                 parts.append(velocity_action[idx_action].reshape(-1))
@@ -2260,6 +3364,7 @@ class OmniMoTModel(ImaginaireModel):
         sigma_max: float = 80.0,
         skip_text_tokens_for_cfg: bool = False,
         normalize_cfg: bool = False,
+        use_batched_cfg: bool = False,
         upsample_task: str | None = None,
         upsample_max_new_tokens: int = 2048,
         upsample_temperature: float | None = 0.7,
@@ -2302,6 +3407,12 @@ class OmniMoTModel(ImaginaireModel):
             sigma_max (float): Maximum sigma for the EDM sampler.
             skip_text_tokens_for_cfg (bool): If True, skip text tokens in unconditional branch.
             normalize_cfg (bool): If True, normalize the CFG output.
+            use_batched_cfg (bool): If True, run cond + uncond as one batched forward of
+                size 2N (mutually exclusive with cfg-parallel). Opt-in; default False
+                keeps this API conservative for saturated or memory-constrained workloads.
+                ``OmniInference`` explicitly passes the configured
+                ``SetupOverrides.use_batched_cfg`` policy.
+                Reuses a doubled pack template and a shared text K/V cache when eligible.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -2348,8 +3459,11 @@ class OmniMoTModel(ImaginaireModel):
         Returns:
             Dict with keys:
                 - "vision": List of vision latent tensors (one per sample, variable shapes)
-                - "action": List of external-space action tensors or None
-                  (only present when action_gen=True and has_action)
+                - "action": List of external-space action tensors
+                  (only present when the packed sequence marks action tokens as
+                  denoising targets, i.e. WAM / inverse dynamics. Plans whose
+                  actions are pure conditioning — forward dynamics, temporal-causal
+                  action conditioning — generate no actions and return no key)
 
         Raises:
             ValueError: If the number of samples does not match the number of noise tensors or seeds.
@@ -2396,6 +3510,7 @@ class OmniMoTModel(ImaginaireModel):
             initial_noise,
             condition_reference,
             condition_mask,
+            has_noisy_actions,
         ) = self._prepare_inference_data(data_batch, seed, has_negative_prompt)
 
         if n_sample is not None:
@@ -2406,6 +3521,22 @@ class OmniMoTModel(ImaginaireModel):
             n_sample = len(initial_noise)
 
         assert n_sample == len(seed), f"Number of samples {n_sample} must match number of seeds {len(seed)}"
+
+        # Batched CFG: pre-compute the doubled (cond + uncond) context
+        # once so velocity_fn can run both guidance branches as a single forward
+        # of size 2N instead of two sequential forwards of size N. The forward
+        # path is read-only on these fields, so tensor refs are reused (no copy).
+        if use_batched_cfg:
+            cfgp_on = self.parallel_dims is not None and self.parallel_dims.cfgp_enabled
+            if cfgp_on:
+                log.warning("CFG parallelism takes precedence over batched CFG; disabling batched CFG.")
+                use_batched_cfg = False
+        if use_batched_cfg:
+            sequence_plans_doubled = list(sequence_plans) + list(sequence_plans)
+            gen_data_clean_doubled = self._duplicate_gen_data_clean(gen_data_clean)
+        else:
+            sequence_plans_doubled = None
+            gen_data_clean_doubled = None
 
         # Optional per-step velocity postprocess hook. Built once via a builder
         # that receives the prepared inference state. The returned callable (if
@@ -2425,32 +3556,10 @@ class OmniMoTModel(ImaginaireModel):
                 gen_data_clean=gen_data_clean,
             )
 
-        # Create a velocity function for a single sample (for use with self.sampler).
-        # FSDP collective-sequence alignment (throughput-preset inference).
-        #
-        # In throughput-preset inference each rank holds a different sample,
-        # and different samples can diverge on (a) the CFG decision per
-        # step — ``guidance != 1.0`` (and the optional ``guidance_interval``
-        # gate) determines whether ``velocity_fn`` issues 1 or 2 model
-        # forwards — and (b) ``num_steps``. Either divergence makes the
-        # FSDP allgather sequence misalign across ranks, deadlocking NCCL
-        # at the 30-min watchdog timeout.
-        #
-        # We align in two places:
-        #   1. Inside velocity_fn (per call): all_reduce the local CFG
-        #      decision; if ANY rank needs CFG, every rank does both
-        #      forwards (cond + uncond). Ranks whose local decision was
-        #      "no CFG" return ``cond_v`` directly — bit-identical to the
-        #      original no-CFG path (no guidance blend, no normalize_cfg).
-        #   2. Around the sampler call: all_reduce the local num_steps;
-        #      ranks with local < max issue a dummy sampler call with the
-        #      remaining steps to pad the FSDP allgather stream. The
-        #      dummy call's output is discarded; ``latents`` is never
-        #      re-bound.
-        #
-        # Both collectives are scoped to the FSDP shard group (the only
-        # process group whose collective sequence is at risk), so they're
-        # safe under non-trivial parallel layouts.
+        # In throughput-preset inference, each FSDP rank can hold a different
+        # sample. Resolve the shard group before selecting the fast path so a
+        # rank-local postprocess/packing difference cannot make peers issue a
+        # different number of model forwards and deadlock collectives.
         if (
             self.parallel_dims is not None
             and self.parallel_dims.dp_shard_mesh is not None
@@ -2463,273 +3572,520 @@ class OmniMoTModel(ImaginaireModel):
             _dp_shard_group = None
             _align_device = None
 
-        def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
-            # len(noise_x) == B, noise_x[i] is shape (D)
-            # timestep is shape (B, 1)
-            torch.compiler.cudagraph_mark_step_begin()
+        if (
+            self.parallel_dims is not None
+            and self.parallel_dims.cfgp_enabled
+            and self.parallel_dims.cfgp_mesh is not None
+            and torch.distributed.is_initialized()
+            and self.parallel_dims.cfgp_mesh.size() > 1
+        ):
+            _cfgp_group = self.parallel_dims.cfgp_mesh.get_group()
+            _align_device = self.tensor_kwargs["device"]
+        else:
+            _cfgp_group = None
 
-            assert timestep.ndim == 2, f"timestep must be 2D, got {timestep.shape}"
-            assert timestep.shape == (1, 1), f"timestep must be (1, 1), got {timestep.shape}"
+        # Static eligibility for the fused cond+uncond fast path (velocity_fn also
+        # requires ``_any_needs_guidance_path`` per step). Keep pack / text-KV alloc in
+        # sync with this predicate so we do not build unused 2N resources.
+        batched_cfg_fast_path = _all_group_ranks_allow(
+            use_batched_cfg and velocity_postprocess is None and not skip_text_tokens_for_cfg,
+            _dp_shard_group,
+            _align_device,
+        )
 
-            # Expand timestep to (B, 1)
-            timestep = timestep.repeat(len(noise_x), 1)
+        # Configs written before the switch have no such key: they keep reusing the request caches.
+        reuse_pack_templates = getattr(
+            self.config, "inference_reuse_request_cache", True
+        ) and self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+        cond_packed_sequence_template: PackedSequence | None = None
+        uncond_packed_sequence_template: PackedSequence | None = None
+        batched_packed_sequence_template: PackedSequence | None = None
+        if reuse_pack_templates:
+            include_end_of_generation_token = self._derive_include_end_of_generation_token()
+            zero_timesteps = torch.zeros((gen_data_clean.batch_size,), dtype=torch.float32)  # [B]
+            cond_packed_sequence_template = self._pack_input_sequence(
+                sequence_plans,
+                cond_tokens,
+                gen_data_clean,
+                zero_timesteps,
+                include_end_of_generation_token=include_end_of_generation_token,
+                skip_text_tokens=False,
+            )
+            cond_packed_sequence_template.to_cuda()
+            if not batched_cfg_fast_path and (guidance != 1.0 or velocity_postprocess is not None):
+                uncond_packed_sequence_template = self._pack_input_sequence(
+                    sequence_plans,
+                    uncond_tokens,
+                    gen_data_clean,
+                    zero_timesteps,
+                    include_end_of_generation_token=include_end_of_generation_token,
+                    skip_text_tokens=skip_text_tokens_for_cfg,
+                )
+                uncond_packed_sequence_template.to_cuda()
 
-            def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool):
-                return self._get_velocity(
-                    net=net,
-                    noise_x=noise_x,
-                    timestep=timestep,
-                    text_tokens=tokens,
-                    sequence_plans=sequence_plans,
-                    gen_data_clean=gen_data_clean,
-                    skip_text_tokens=skip_text_tokens,
+        if (
+            reuse_pack_templates
+            and batched_cfg_fast_path
+            and sequence_plans_doubled is not None
+            and gen_data_clean_doubled is not None
+        ):
+            zero_timesteps_doubled = torch.zeros((gen_data_clean_doubled.batch_size,), dtype=torch.float32)  # [2B]
+            batched_packed_sequence_template = self._pack_input_sequence(
+                sequence_plans_doubled,
+                list(cond_tokens) + list(uncond_tokens),
+                gen_data_clean_doubled,
+                zero_timesteps_doubled,
+                include_end_of_generation_token=include_end_of_generation_token,
+                skip_text_tokens=False,
+            )
+            batched_packed_sequence_template.to_cuda()
+
+        # Create a velocity function for a single sample (for use with self.sampler).
+        # FSDP collective-sequence alignment (throughput-preset inference).
+        #
+        # In throughput-preset inference each rank holds a different sample,
+        # and different samples can diverge on (a) whether text CFG or a
+        # velocity postprocess hook requires a second forward, (b) whether
+        # the fused batched path is locally eligible, and (c) ``num_steps``.
+        # Any divergence makes the FSDP allgather sequence misalign across
+        # ranks, deadlocking NCCL at the 30-min watchdog timeout.
+        #
+        # We align in three places:
+        #   1. Before velocity_fn: MIN-reduce fused-path eligibility so every
+        #      rank agrees on batched versus sequential CFG.
+        #   2. Inside velocity_fn (per call): MAX-reduce whether any rank
+        #      needs CFG/postprocessing; if so, every rank performs the same
+        #      forward sequence. Ranks whose local decision was "no CFG" return
+        #      ``cond_v`` directly — bit-identical to the original no-CFG path.
+        #   3. Around the sampler call: all_reduce the local num_steps;
+        #      ranks with local < max issue a dummy sampler call with the
+        #      remaining steps to pad the FSDP allgather stream. The
+        #      dummy call's output is discarded; ``latents`` is never
+        #      re-bound.
+        #
+        # Guidance-path alignment is scoped to the FSDP shard group (the only
+        # process group whose model-forward sequence is at risk). Text-KV
+        # eligibility must additionally agree across CFG-parallel peers before
+        # either peer installs the request-local attention dispatch.
+        reuse_text_kv = self._can_reuse_inference_text_kv(
+            sequence_plans,
+            gen_data_clean,
+            reuse_pack_templates=reuse_pack_templates,
+            has_velocity_postprocess=velocity_postprocess is not None,
+        )
+        reuse_text_kv = _all_group_ranks_allow(
+            reuse_text_kv,
+            _dp_shard_group,
+            _align_device,
+        )
+        reuse_text_kv = _all_group_ranks_allow(
+            reuse_text_kv,
+            _cfgp_group,
+            _align_device,
+        )
+        cond_text_kv_cache: list[UndKVCache] | None = None
+        uncond_text_kv_cache: list[UndKVCache] | None = None
+        batched_text_kv_cache: list[UndKVCache] | None = None
+        # Request-scoped: install only for this generate call and restore afterward so we
+        # never permanently shadow another dispatch_attention_fn on the model.
+        previous_attention_dispatch = None
+        try:
+            if reuse_text_kv:
+                target_net = net or self.net
+                if target_net is None:
+                    raise RuntimeError(
+                        "Cannot install memory-aware attention dispatch: net is None "
+                        "(pass net= or ensure self.net is built)."
+                    )
+                previous_attention_dispatch = install_inference_memory_attention_dispatch(target_net)
+                # Cond cache covers no-CFG steps. When the fused path is eligible,
+                # CFG steps use ``batched_text_kv_cache`` only — skip allocating the
+                # unused uncond stack. Otherwise keep the sequential cond+uncond pair.
+                cond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+                if batched_cfg_fast_path:
+                    # Shared und K/V for the fused cond+uncond (B=2) pack. Filled on
+                    # the first batched forward; later steps run gen-only with
+                    # per-sample isolation in ``_attention_gen_with_cached_text``.
+                    batched_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+                elif guidance != 1.0 or velocity_postprocess_builder is not None:
+                    uncond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+
+            def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
+                # len(noise_x) == B, noise_x[i] is shape (D)
+                # timestep is shape (B, 1)
+                torch.compiler.cudagraph_mark_step_begin()
+
+                assert timestep.ndim == 2, f"timestep must be 2D, got {timestep.shape}"
+                assert timestep.shape == (1, 1), f"timestep must be (1, 1), got {timestep.shape}"
+
+                # Expand timestep to (B, 1)
+                timestep = timestep.repeat(len(noise_x), 1)  # [B,1]
+
+                def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool) -> list[torch.Tensor]:
+                    nonlocal uncond_text_kv_cache
+                    packed_sequence_template = None
+                    text_kv_cache: list[UndKVCache] | None = None
+                    if reuse_pack_templates:
+                        if tokens is cond_tokens and not skip_text_tokens:
+                            packed_sequence_template = cond_packed_sequence_template
+                            text_kv_cache = cond_text_kv_cache
+                        elif tokens is uncond_tokens and skip_text_tokens == skip_text_tokens_for_cfg:
+                            packed_sequence_template = uncond_packed_sequence_template
+                            if reuse_text_kv and uncond_text_kv_cache is None:
+                                uncond_text_kv_cache = self._make_inference_text_kv_cache(net)
+                            text_kv_cache = uncond_text_kv_cache
+                    memory: MemoryState | None = (
+                        InferenceTextKVMemoryState(text_kv_cache) if text_kv_cache is not None else None
+                    )
+                    return self._get_velocity(
+                        net=net,
+                        noise_x=noise_x,
+                        timestep=timestep,
+                        text_tokens=tokens,
+                        sequence_plans=sequence_plans,
+                        gen_data_clean=gen_data_clean,
+                        skip_text_tokens=skip_text_tokens,
+                        packed_sequence_template=packed_sequence_template,
+                        memory=memory,
+                        has_noisy_actions=has_noisy_actions,
+                    )
+
+                needs_text_cfg = guidance != 1.0
+                if needs_text_cfg and guidance_interval is not None:
+                    assert len(guidance_interval) == 2, f"guidance_interval must be [lo, hi], got {guidance_interval}"
+                    t_lo, t_hi = guidance_interval
+                    needs_text_cfg = t_lo < timestep[0].item() < t_hi
+
+                # FSDP alignment: if ANY rank in the shard group needs a second
+                # forward for text CFG or a velocity postprocess hook, every rank
+                # must issue two sequential forwards (or one globally eligible
+                # batched forward) so the allgather sequence stays aligned.
+                needs_guidance_path = needs_text_cfg or velocity_postprocess is not None
+                _any_needs_guidance_path = _any_dp_shard_rank_needs_guidance_path(
+                    needs_guidance_path,
+                    _dp_shard_group,
+                    _align_device,
                 )
 
-            needs_text_cfg = guidance != 1.0
-            if needs_text_cfg and guidance_interval is not None:
-                assert len(guidance_interval) == 2, f"guidance_interval must be [lo, hi], got {guidance_interval}"
-                t_lo, t_hi = guidance_interval
-                needs_text_cfg = t_lo < timestep[0].item() < t_hi
+                # Fast path: no rank needs CFG or postprocessing — single forward.
+                if not _any_needs_guidance_path:
+                    return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
 
-            # FSDP alignment: if ANY rank in the shard group needs text-CFG
-            # this call, every rank must take the CFG path so the allgather
-            # sequence stays aligned across ranks.
-            if _dp_shard_group is not None:
-                _cfg_t = torch.tensor([1 if needs_text_cfg else 0], device=_align_device, dtype=torch.int32)
-                torch.distributed.all_reduce(_cfg_t, op=torch.distributed.ReduceOp.MAX, group=_dp_shard_group)
-                _any_needs_text_cfg = bool(_cfg_t.item())
-            else:
-                _any_needs_text_cfg = needs_text_cfg
+                # Batched-CFG fast path (opt-in): run cond + uncond as one forward of
+                # size 2N instead of two sequential N forwards. Removes the per-step
+                # python orchestration between the two forwards. Only taken when there
+                # is no postprocess hook, text-CFG is needed somewhere in the FSDP
+                # shard group this step, and we are not skipping text tokens for the
+                # uncond branch. cfg-parallel was already ruled out at setup. Falls
+                # through to the standard path otherwise.
+                # Under FSDP, every rank takes this path whenever ``_any_needs_guidance_path``
+                # so the allgather sequence stays aligned (same 1-forward-per-step
+                # count); ranks whose local decision was no-CFG still return cond only.
+                if batched_cfg_fast_path and _any_needs_guidance_path:
+                    assert sequence_plans_doubled is not None and gen_data_clean_doubled is not None
+                    n = len(noise_x)
+                    batched_memory: MemoryState | None = (
+                        InferenceTextKVMemoryState(batched_text_kv_cache) if batched_text_kv_cache is not None else None
+                    )
+                    velocities = self._get_velocity(
+                        net=net,
+                        noise_x=noise_x + noise_x,
+                        timestep=torch.cat([timestep, timestep], dim=0),
+                        text_tokens=list(cond_tokens) + list(uncond_tokens),
+                        sequence_plans=sequence_plans_doubled,
+                        gen_data_clean=gen_data_clean_doubled,
+                        skip_text_tokens=False,
+                        packed_sequence_template=batched_packed_sequence_template,
+                        memory=batched_memory,
+                        has_noisy_actions=has_noisy_actions,
+                    )
+                    cond_v = velocities[:n]
+                    uncond_v = velocities[n:]
+                    if not needs_text_cfg:
+                        return cond_v
+                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                    if normalize_cfg:
+                        v_pred = [
+                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                            for v_i, c_i in zip(v_pred, cond_v)
+                        ]
+                    return v_pred
 
-            # Fast path: no text-CFG anywhere and no postprocess hook — single forward.
-            if not _any_needs_text_cfg and velocity_postprocess is None:
-                return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+                # Fast path: only text-CFG and no postprocess — preserve the
+                # cfgp-parallel branch so two-rank CFG parallelism stays available.
+                if velocity_postprocess is None:
+                    cond_v, uncond_v = self._run_classifier_free_guidance(
+                        cond_tokens=cond_tokens,
+                        uncond_tokens=uncond_tokens,
+                        skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
+                        single_velocity_fn=_single_velocity_fn,
+                    )
+                    if not needs_text_cfg:
+                        # Peers needed CFG so we ran the uncond forward to keep
+                        # FSDP allgather aligned; locally we still return cond.
+                        return cond_v
+                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                    if normalize_cfg:
+                        v_pred = [
+                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                            for v_i, c_i in zip(v_pred, cond_v)
+                        ]
+                    return v_pred
 
-            # Fast path: only text-CFG and no postprocess — preserve the
-            # cfgp-parallel branch so two-rank CFG parallelism stays available.
-            if velocity_postprocess is None:
-                cond_v, uncond_v = self._run_classifier_free_guidance(
-                    cond_tokens=cond_tokens,
-                    uncond_tokens=uncond_tokens,
-                    skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
-                    single_velocity_fn=_single_velocity_fn,
-                )
+                # Conditional forward, then per-step postprocess hook. Hook runs
+                # sequentially; cfgp parallelism not used on this path.
+                cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+                cond_v = velocity_postprocess(cond_v_full, noise_x, timestep)
+
+                uncond_v = _single_velocity_fn(uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg)
                 if not needs_text_cfg:
-                    # Peers needed CFG so we ran the uncond forward to keep
-                    # FSDP allgather aligned; locally we still return cond.
+                    # Same alignment story as above for the postprocess branch.
                     return cond_v
+
                 v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+
                 if normalize_cfg:
                     v_pred = [
                         v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
                         for v_i, c_i in zip(v_pred, cond_v)
                     ]
+
                 return v_pred
 
-            # Conditional forward, then per-step postprocess hook. Hook runs
-            # sequentially; cfgp parallelism not used on this path.
-            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)
-            cond_v = velocity_postprocess(cond_v_full, noise_x, timestep)
+            # Run sampler for all samples at once.
+            sampler = sampler or self.sampler
+            scheduler_type = self.config.rectified_flow_inference_config.scheduler_type
+            if isinstance(sampler, FixedStepSampler):
+                num_steps = len(sampler.t_list) - 1
+                shift = 0.0
 
-            uncond_v = _single_velocity_fn(uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg)
-            if not needs_text_cfg:
-                # Same alignment story as above for the postprocess branch.
-                return cond_v
+            # FSDP collective-sequence alignment (sampler outer loop). See the
+            # large block above the velocity_fn definition for the full
+            # rationale. all_reduce on the local num_steps so every rank knows
+            # the max; below, ranks with local < max issue a dummy sampler call
+            # to pad their FSDP allgather sequence.
+            if _dp_shard_group is not None:
+                _local_steps_t = torch.tensor([num_steps], device=_align_device, dtype=torch.int32)
+                torch.distributed.all_reduce(_local_steps_t, op=torch.distributed.ReduceOp.MAX, group=_dp_shard_group)
+                _max_num_steps = int(_local_steps_t.item())
+            else:
+                _max_num_steps = num_steps
+            _extra_num_steps = _max_num_steps - num_steps
 
-            v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+            if isinstance(sampler, FixedStepSampler):
+                log.info(f"Using sampler: FixedStep (t_list={sampler.t_list}, sample_type={sampler.sample_type})")
+            elif scheduler_type == "unipc":
+                log.info(f"Using sampler: UniPC (shift={shift}, num_steps={num_steps})")
+            else:
+                log.info(f"Using sampler: EDM (sigma_max={sigma_max}, num_steps={num_steps})")
 
-            if normalize_cfg:
-                v_pred = [
-                    v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
-                    for v_i, c_i in zip(v_pred, cond_v)
-                ]
+            fixed_step_sampler_kwargs = {}
+            if isinstance(sampler, FixedStepSampler):
+                fixed_step_sampler_kwargs = {
+                    "condition_reference": condition_reference,
+                    "condition_mask": condition_mask,
+                }
 
-            return v_pred
+            # Mixed-precision diffusion steps: select W8A16/W8A8 once per
+            # sampler step; reset (trace + staging cleanup) when the request
+            # ends, including on error.
+            _mixed_precision_runtime = getattr(self.net, "_mixed_precision_runtime", None)
+            _step_callback = _mixed_precision_runtime.set_step if _mixed_precision_runtime is not None else None
 
-        # Run sampler for all samples at once.
-        sampler = sampler or self.sampler
-        scheduler_type = self.config.rectified_flow_inference_config.scheduler_type
-        if isinstance(sampler, FixedStepSampler):
-            num_steps = len(sampler.t_list) - 1
-            shift = 0.0
-
-        # FSDP collective-sequence alignment (sampler outer loop). See the
-        # large block above the velocity_fn definition for the full
-        # rationale. all_reduce on the local num_steps so every rank knows
-        # the max; below, ranks with local < max issue a dummy sampler call
-        # to pad their FSDP allgather sequence.
-        if _dp_shard_group is not None:
-            _local_steps_t = torch.tensor([num_steps], device=_align_device, dtype=torch.int32)
-            torch.distributed.all_reduce(_local_steps_t, op=torch.distributed.ReduceOp.MAX, group=_dp_shard_group)
-            _max_num_steps = int(_local_steps_t.item())
-        else:
-            _max_num_steps = num_steps
-        _extra_num_steps = _max_num_steps - num_steps
-
-        if isinstance(sampler, FixedStepSampler):
-            log.info(f"Using sampler: FixedStep (t_list={sampler.t_list}, sample_type={sampler.sample_type})")
-        elif scheduler_type == "unipc":
-            log.info(f"Using sampler: UniPC (shift={shift}, num_steps={num_steps})")
-        else:
-            log.info(f"Using sampler: EDM (sigma_max={sigma_max}, num_steps={num_steps})")
-
-        fixed_step_sampler_kwargs = {}
-        if isinstance(sampler, FixedStepSampler):
-            fixed_step_sampler_kwargs = {
-                "condition_reference": condition_reference,
-                "condition_mask": condition_mask,
-            }
-
-        if isinstance(sampler, FixedStepSampler) or scheduler_type == "unipc":
-            latents = sampler(
-                velocity_fn,
-                initial_noise,
-                num_steps=num_steps,
-                shift=shift,
-                seed=seed,
-                **fixed_step_sampler_kwargs,
-            )
-            if _extra_num_steps > 0:
-                # Dummy sampler call to issue (_extra_num_steps × per-step)
-                # FSDP allgathers; output discarded so `latents` keeps the
-                # real result captured above. Slow ranks have _extra_num_steps==0
-                # here, but they're issuing the SAME number of in-sampler
-                # collectives via their longer real call.
-                log.debug(
-                    f"FSDP alignment: dummy sampler run with {_extra_num_steps} "
-                    f"extra steps (local={num_steps}, max={_max_num_steps})"
-                )
-                _ = sampler(
-                    velocity_fn,
-                    latents,
-                    num_steps=_extra_num_steps,
-                    shift=shift,
-                    seed=seed,
-                    **fixed_step_sampler_kwargs,
-                )
-        else:
-            # EDM Sampler
-            chunk_sizes = [_x.shape[0] for _x in initial_noise]
-            initial_noise = torch.cat(initial_noise, dim=0)
-
-            def x0_fn(noise_x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-                assert sigma.ndim == 0, f"sigma must be 0D, got {sigma.shape}"
-                timestep_rf = sigma * float(self.config.rectified_flow_inference_config.num_train_timesteps)
-
-                # Convert noise_x to list of tensors for velocity_fn, and then
-                # concatenate the results back into a single tensor.
-                _noise_x = list(torch.split(noise_x, chunk_sizes, dim=0))
-                _velocity_pred = velocity_fn(_noise_x, timestep_rf.reshape(1, 1))
-                velocity_pred = torch.cat(_velocity_pred, dim=0)
-
-                x0_pred = noise_x - sigma * velocity_pred
-                return x0_pred
-
-            latents = sampler(
-                x0_fn,
-                initial_noise,
-                num_steps=num_steps,
-                sigma_max=sigma_max,
-                sigma_min=0.002,
-                solver_option="2ab",
-            )
-            if _extra_num_steps > 0:
-                # Pad the FSDP allgather sequence with ``_extra_num_steps``
-                # direct ``x0_fn`` calls instead of a second EDM sampler
-                # run. Avoids two EDM-specific footguns:
-                #   (1) ``EDMSampler._forward_impl`` always runs an extra
-                #       ``sample_clean`` denoiser forward (see
-                #       ``cosmos_framework/model/vfm/diffusion/samplers/edm.py``).
-                #       A nested sampler call would add one too many
-                #       forwards on fast ranks, since the slow rank's
-                #       single call also pays the ``sample_clean`` cost.
-                #   (2) ``get_rev_ts(..., num_steps=0)`` divides by zero,
-                #       producing NaN sigmas. The fix's ``extra==1`` edge
-                #       case would need num_steps=0 to balance the count.
-                # Direct ``x0_fn`` calls bypass both: each call routes
-                # through the same ``velocity_fn`` closure (so the
-                # per-call CFG all_reduce still aligns ranks), issues
-                # exactly one model forward, and discards its return.
-                # ``latents`` is the catted single tensor at this point;
-                # the dummy sigma value is irrelevant for collective
-                # alignment because the model's allgather sequence is
-                # determined by tensor shapes, not sigma.
-                log.debug(
-                    f"FSDP alignment: padding {_extra_num_steps} dummy x0_fn calls "
-                    f"(local={num_steps}, max={_max_num_steps})"
-                )
-                # ``x0_fn`` expects a sigma in the RF domain (the real EDM
-                # loop converts raw sigmas via ``sigmas_L / (1 + sigmas_L)``
-                # at edm.py:174, landing them in ``(0, 1)``). Mirror that
-                # transform here so the dummy call's timestep stays in the
-                # same numerical domain as a real sampler step. The exact
-                # value doesn't matter for collective alignment, only the
-                # domain.
-                _dummy_sigma = latents.new_tensor(sigma_max / (1.0 + sigma_max))
-                for _ in range(_extra_num_steps):
-                    _ = x0_fn(latents, _dummy_sigma)
-            latents = list(torch.split(latents, chunk_sizes, dim=0))
-
-        # Split flattened latents back into vision latents, external actions, and sound latents
-        # Mirror the per-sample logic from _prepare_inference_data:
-        # Order: [vision | action (if present) | sound (if present)]
-        # action/sound lists are dense (only modality-having samples), so use separate indexes.
-        result_vision: list[torch.Tensor] = []
-        result_action: list[torch.Tensor] = []
-        result_sound: list[torch.Tensor] = []
-        action_processing_records = get_action_processing_records(data_batch)
-        idx_vision = 0
-        idx_action = 0
-        idx_sound = 0
-        num_vision_items = gen_data_clean.num_vision_items_per_sample
-
-        for i in range(n_sample):
-            offset = 0
-
-            # Extract vision
-            n_vis = num_vision_items[i] if num_vision_items is not None else 1
-            for j in range(n_vis):
-                vision_shape = gen_data_clean.x0_tokens_vision[idx_vision + j].shape
-                vision_dim = int(torch.prod(torch.tensor(vision_shape)))
-                if j == n_vis - 1:  # the last vision item is the only target for each sample.
-                    result_vision.append(latents[i][offset : offset + vision_dim].reshape(vision_shape))
-                else:  # the other vision items are the condition inputs that we don't need to return
-                    pass
-                offset += vision_dim
-            idx_vision += n_vis
-
-            # Extract action if present
-            if self.config.action_gen and sequence_plans[i].has_action:
-                assert gen_data_clean.x0_tokens_action is not None
-                action_shape = gen_data_clean.x0_tokens_action[idx_action].shape
-                action_dim = int(torch.prod(torch.tensor(action_shape)))
-                action_model = latents[i][offset : offset + action_dim].reshape(action_shape)  # [T,D_model]
-                action_record = action_processing_records[i] if i < len(action_processing_records) else None
-                if action_record is None:
-                    raise ValueError(
-                        f"Generated action output for sample {i} cannot be externalized without "
-                        "action_processing_record"
+            try:
+                if isinstance(sampler, FixedStepSampler) or scheduler_type == "unipc":
+                    latents = sampler(
+                        velocity_fn,
+                        initial_noise,
+                        num_steps=num_steps,
+                        shift=shift,
+                        seed=seed,
+                        step_callback=_step_callback,
+                        **fixed_step_sampler_kwargs,
                     )
-                action_external = ActionProcessor.postprocess_action(action_model, action_record)  # [T,D_raw]
-                result_action.append(action_external)
-                offset += action_dim
-                idx_action += 1
+                    if _extra_num_steps > 0:
+                        # Dummy sampler call to issue (_extra_num_steps × per-step)
+                        # FSDP allgathers; output discarded so `latents` keeps the
+                        # real result captured above. Slow ranks have _extra_num_steps==0
+                        # here, but they're issuing the SAME number of in-sampler
+                        # collectives via their longer real call.
+                        log.debug(
+                            f"FSDP alignment: dummy sampler run with {_extra_num_steps} "
+                            f"extra steps (local={num_steps}, max={_max_num_steps})"
+                        )
+                        if _mixed_precision_runtime is not None:
+                            # Deterministic cheap padding: the FSDP-alignment dummy
+                            # call must not inherit the last real step's W8A16.
+                            _mixed_precision_runtime.set_base_precision()
+                        _ = sampler(
+                            velocity_fn,
+                            latents,
+                            num_steps=_extra_num_steps,
+                            shift=shift,
+                            seed=seed,
+                            **fixed_step_sampler_kwargs,
+                        )
+                else:
+                    # EDM Sampler
+                    chunk_sizes = [_x.shape[0] for _x in initial_noise]
+                    initial_noise = torch.cat(initial_noise, dim=0)
 
-            # Extract sound if present
-            if self.config.sound_gen and sequence_plans[i].has_sound:
-                assert gen_data_clean.x0_tokens_sound is not None
-                sound_shape = gen_data_clean.x0_tokens_sound[idx_sound].shape
-                sound_dim = int(torch.prod(torch.tensor(sound_shape)))
-                result_sound.append(latents[i][offset : offset + sound_dim].reshape(sound_shape))
-                offset += sound_dim
-                idx_sound += 1
+                    def x0_fn(noise_x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+                        assert sigma.ndim == 0, f"sigma must be 0D, got {sigma.shape}"
+                        timestep_rf = sigma * float(self.config.rectified_flow_inference_config.num_train_timesteps)
 
-        result: dict[str, list[torch.Tensor]] = {"vision": result_vision}
-        if self.config.action_gen and len(result_action) > 0:
-            result["action"] = result_action
-        if self.config.sound_gen and len(result_sound) > 0:
-            result["sound"] = result_sound
-        return result
+                        # Convert noise_x to list of tensors for velocity_fn, and then
+                        # concatenate the results back into a single tensor.
+                        _noise_x = list(torch.split(noise_x, chunk_sizes, dim=0))
+                        _velocity_pred = velocity_fn(_noise_x, timestep_rf.reshape(1, 1))
+                        velocity_pred = torch.cat(_velocity_pred, dim=0)
+
+                        x0_pred = noise_x - sigma * velocity_pred
+                        return x0_pred
+
+                    latents = sampler(
+                        x0_fn,
+                        initial_noise,
+                        num_steps=num_steps,
+                        sigma_max=sigma_max,
+                        sigma_min=0.002,
+                        solver_option="2ab",
+                        step_callback=_step_callback,
+                    )
+                    if _extra_num_steps > 0:
+                        # Pad the FSDP allgather sequence with ``_extra_num_steps``
+                        # direct ``x0_fn`` calls instead of a second EDM sampler
+                        # run. Avoids two EDM-specific footguns:
+                        #   (1) ``EDMSampler._forward_impl`` always runs an extra
+                        #       ``sample_clean`` denoiser forward (see
+                        #       ``cosmos_framework/model/vfm/diffusion/samplers/edm.py``).
+                        #       A nested sampler call would add one too many
+                        #       forwards on fast ranks, since the slow rank's
+                        #       single call also pays the ``sample_clean`` cost.
+                        #   (2) ``get_rev_ts(..., num_steps=0)`` divides by zero,
+                        #       producing NaN sigmas. The fix's ``extra==1`` edge
+                        #       case would need num_steps=0 to balance the count.
+                        # Direct ``x0_fn`` calls bypass both: each call routes
+                        # through the same ``velocity_fn`` closure (so the
+                        # per-call CFG all_reduce still aligns ranks), issues
+                        # exactly one model forward, and discards its return.
+                        # ``latents`` is the catted single tensor at this point;
+                        # the dummy sigma value is irrelevant for collective
+                        # alignment because the model's allgather sequence is
+                        # determined by tensor shapes, not sigma.
+                        log.debug(
+                            f"FSDP alignment: padding {_extra_num_steps} dummy x0_fn calls "
+                            f"(local={num_steps}, max={_max_num_steps})"
+                        )
+                        if _mixed_precision_runtime is not None:
+                            # Deterministic cheap padding: the FSDP-alignment dummy
+                            # call must not inherit the last real step's W8A16.
+                            _mixed_precision_runtime.set_base_precision()
+                        # ``x0_fn`` expects a sigma in the RF domain (the real EDM
+                        # loop converts raw sigmas via ``sigmas_L / (1 + sigmas_L)``
+                        # at edm.py:174, landing them in ``(0, 1)``). Mirror that
+                        # transform here so the dummy call's timestep stays in the
+                        # same numerical domain as a real sampler step. The exact
+                        # value doesn't matter for collective alignment, only the
+                        # domain.
+                        _dummy_sigma = latents.new_tensor(sigma_max / (1.0 + sigma_max))
+                        for _ in range(_extra_num_steps):
+                            _ = x0_fn(latents, _dummy_sigma)
+                    latents = list(torch.split(latents, chunk_sizes, dim=0))
+            finally:
+                if _mixed_precision_runtime is not None:
+                    _mixed_precision_runtime.reset()
+
+            # Split flattened latents back into vision latents, LiDAR latents, external actions,
+            # and sound latents. Mirror the per-sample logic from _prepare_inference_data:
+            # Order: [vision | lidar (if present) | action (if present) | sound (if present)]
+            # lidar/action/sound lists are dense (only modality-having samples), so use separate indexes.
+            result_vision: list[torch.Tensor] = []
+            result_lidar: list[torch.Tensor] = []
+            result_action: list[torch.Tensor] = []
+            result_sound: list[torch.Tensor] = []
+            action_processing_records = get_action_processing_records(data_batch)
+            idx_vision = 0
+            idx_lidar = 0
+            idx_action = 0
+            idx_sound = 0
+            num_vision_items = gen_data_clean.num_vision_items_per_sample
+            num_lidar_items = gen_data_clean.num_lidar_items_per_sample
+
+            for i in range(n_sample):
+                offset = 0
+
+                # Extract vision
+                n_vis = num_vision_items[i] if num_vision_items is not None else 1
+                for j in range(n_vis):
+                    vision_shape = gen_data_clean.x0_tokens_vision[idx_vision + j].shape
+                    vision_dim = int(torch.prod(torch.tensor(vision_shape)))
+                    # Keep standard single-vision inference dense, including conditioned Action
+                    # vision. Multi-item camera/LiDAR inference returns only generated items.
+                    if n_vis == 1 or is_item_generated(
+                        sequence_plans[i].condition_frame_indexes_vision,
+                        item_idx=j,
+                        num_items=n_vis,
+                        latent_t=int(vision_shape[2]),
+                    ):
+                        result_vision.append(latents[i][offset : offset + vision_dim].reshape(vision_shape))
+                    offset += vision_dim
+                idx_vision += n_vis
+
+                # Extract LiDAR if present, on the same rule: every item the plan generates.
+                if sequence_plans[i].has_lidar:
+                    assert gen_data_clean.x0_tokens_lidar is not None
+                    n_lidar = num_lidar_items[i] if num_lidar_items is not None else 1
+                    for j in range(n_lidar):
+                        lidar_shape = gen_data_clean.x0_tokens_lidar[idx_lidar + j].shape
+                        lidar_dim = int(torch.prod(torch.tensor(lidar_shape)))
+                        if is_item_generated(
+                            sequence_plans[i].condition_frame_indexes_lidar,
+                            item_idx=j,
+                            num_items=n_lidar,
+                            latent_t=int(lidar_shape[2]),
+                        ):
+                            result_lidar.append(latents[i][offset : offset + lidar_dim].reshape(lidar_shape))
+                        offset += lidar_dim
+                    idx_lidar += n_lidar
+
+                # Extract action if present
+                if has_noisy_actions and sequence_plans[i].has_action:
+                    assert gen_data_clean.x0_tokens_action is not None
+                    action_shape = gen_data_clean.x0_tokens_action[idx_action].shape
+                    action_dim = int(torch.prod(torch.tensor(action_shape)))
+                    action_model = latents[i][offset : offset + action_dim].reshape(action_shape)  # [T,D_model]
+                    action_record = action_processing_records[i] if i < len(action_processing_records) else None
+                    if action_record is None:
+                        raise ValueError(
+                            f"Generated action output for sample {i} cannot be externalized without "
+                            "action_processing_record"
+                        )
+                    action_external = ActionProcessor.postprocess_action(action_model, action_record)  # [T,D_raw]
+                    result_action.append(action_external)
+                    offset += action_dim
+                    idx_action += 1
+
+                # Extract sound if present
+                if self.config.sound_gen and sequence_plans[i].has_sound:
+                    assert gen_data_clean.x0_tokens_sound is not None
+                    sound_shape = gen_data_clean.x0_tokens_sound[idx_sound].shape
+                    sound_dim = int(torch.prod(torch.tensor(sound_shape)))
+                    result_sound.append(latents[i][offset : offset + sound_dim].reshape(sound_shape))
+                    offset += sound_dim
+                    idx_sound += 1
+
+            result: dict[str, list[torch.Tensor]] = {"vision": result_vision}
+            if result_lidar:
+                result["lidar"] = result_lidar
+            if has_noisy_actions and result_action:
+                result["action"] = result_action
+            if self.config.sound_gen and len(result_sound) > 0:
+                result["sound"] = result_sound
+            return result
+        finally:
+            if previous_attention_dispatch is not None:
+                restore_inference_attention_dispatch(previous_attention_dispatch)
 
     def _extract_condition_images_for_visualization(
         self,
@@ -2805,7 +4161,7 @@ class OmniMoTModel(ImaginaireModel):
         Returns:
             Sliced GenerationDataClean.
         """
-        # x0_tokens_action can be an empty list (e.g. image2video mode), not just None
+        # x0_tokens_action can be an empty list for general-video samples, not just None.
         has_action = bool(gen_data_clean.x0_tokens_action)
         has_sound = bool(gen_data_clean.x0_tokens_sound)
 
@@ -2825,6 +4181,7 @@ class OmniMoTModel(ImaginaireModel):
                 else None
             )
             subset_num_items = num_items[start:limit]
+            vision_item_slice = slice(vis_start, vis_end)
         else:
             # Standard single-item mode
             subset_x0_vision = gen_data_clean.x0_tokens_vision[start:limit]
@@ -2837,7 +4194,28 @@ class OmniMoTModel(ImaginaireModel):
                 else None
             )
             subset_num_items = None
+            vision_item_slice = slice(start, limit)
+        # Parallel to the flattened vision item list, so it follows the same slice.
+        subset_num_views_per_vision_item = (
+            gen_data_clean.num_views_per_vision_item[vision_item_slice]
+            if gen_data_clean.num_views_per_vision_item is not None
+            else None
+        )
         fps_vision = gen_data_clean.fps_vision[start:limit] if gen_data_clean.fps_vision is not None else None
+
+        # The LiDAR stream is grouped by sample the same way, so it takes its own slice.
+        num_lidar_items = gen_data_clean.num_lidar_items_per_sample
+        if gen_data_clean.x0_tokens_lidar is None:
+            subset_x0_lidar = None
+            subset_raw_lidar = None
+            subset_num_lidar_items = None
+        else:
+            lidar_counts = num_lidar_items if num_lidar_items is not None else [1] * gen_data_clean.batch_size
+            lidar_slice = slice(sum(lidar_counts[:start]), sum(lidar_counts[:limit]))
+            subset_x0_lidar = gen_data_clean.x0_tokens_lidar[lidar_slice]
+            subset_raw_lidar = gen_data_clean.raw_state_lidar[lidar_slice] if gen_data_clean.raw_state_lidar else None
+            subset_num_lidar_items = None if num_lidar_items is None else num_lidar_items[start:limit]
+        fps_lidar = gen_data_clean.fps_lidar[start:limit] if gen_data_clean.fps_lidar is not None else None
 
         if has_action:
             subset_raw_action = (
@@ -2846,13 +4224,23 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_action = gen_data_clean.x0_tokens_action[start:limit]
             fps_action = gen_data_clean.fps_action[start:limit] if gen_data_clean.fps_action is not None else None
             action_domain_id = gen_data_clean.action_domain_id[start:limit] if gen_data_clean.action_domain_id else None
+            action_contract_id = (
+                gen_data_clean.action_contract_id[start:limit] if gen_data_clean.action_contract_id else None
+            )
+            action_layout_id = gen_data_clean.action_layout_id[start:limit] if gen_data_clean.action_layout_id else None
             raw_action_dim = gen_data_clean.raw_action_dim[start:limit] if gen_data_clean.raw_action_dim else None
+            action_valid_mask = (
+                gen_data_clean.action_valid_mask[start:limit] if gen_data_clean.action_valid_mask else None
+            )
         else:
             subset_raw_action = None
             x0_tokens_action = None
             fps_action = None
             action_domain_id = None
+            action_contract_id = None
+            action_layout_id = None
             raw_action_dim = None
+            action_valid_mask = None
 
         if has_sound:
             subset_raw_sound = gen_data_clean.raw_state_sound[start:limit] if gen_data_clean.raw_state_sound else None
@@ -2877,8 +4265,16 @@ class OmniMoTModel(ImaginaireModel):
             fps_action=fps_action,
             fps_sound=fps_sound,
             action_domain_id=action_domain_id,
+            action_contract_id=action_contract_id,
+            action_layout_id=action_layout_id,
             raw_action_dim=raw_action_dim,
+            action_valid_mask=action_valid_mask,
             num_vision_items_per_sample=subset_num_items,
+            num_views_per_vision_item=subset_num_views_per_vision_item,
+            raw_state_lidar=subset_raw_lidar,
+            x0_tokens_lidar=subset_x0_lidar,
+            fps_lidar=fps_lidar,
+            num_lidar_items_per_sample=subset_num_lidar_items,
         )
 
     @torch.no_grad()
@@ -2889,17 +4285,196 @@ class OmniMoTModel(ImaginaireModel):
     def forward(self, xt, t):
         pass
 
+    @staticmethod
+    def _get_explicit_single_view_metadata(
+        data_batch: dict[str, Any],
+        num_vision_items_per_sample: list[int] | None,
+        batch_size: int,
+    ) -> list[int] | None:
+        """Read one-view item metadata without opting into uint8 per-camera VAE encoding."""
+        num_views = read_positive_int_metadata(
+            data_batch,
+            "num_views_per_vision_item",
+            expected_count=sum(num_vision_items_per_sample or [1] * batch_size),
+        )
+        if num_views is not None and any(num_view != 1 for num_view in num_views):
+            raise ValueError(
+                "Explicit num_views_per_vision_item metadata is only supported for preprocessed "
+                f"single-view inputs, got {num_views}."
+            )
+        return num_views
+
+    @staticmethod
+    def _get_multiview_vae_metadata(
+        data_batch: dict[str, Any],
+        num_vision_items_per_sample: list[int] | None,
+        batch_size: int,
+    ) -> tuple[list[int] | None, list[int] | None]:
+        """Align per-sample multiview metadata with flattened vision items."""
+        if "enable_per_camera_vae_encoding" not in data_batch:
+            return None, None
+
+        sample_n_views = read_positive_int_metadata(data_batch, "sample_n_views", expected_count=batch_size)
+        sample_frames_per_view = read_positive_int_metadata(
+            data_batch,
+            "num_video_frames_per_view",
+            expected_count=batch_size,
+        )
+        if sample_n_views is None or sample_frames_per_view is None:
+            raise ValueError(
+                "sample_n_views and num_video_frames_per_view are required when per-camera VAE encoding is enabled."
+            )
+
+        vision_item_counts = (
+            num_vision_items_per_sample if num_vision_items_per_sample is not None else [1] * batch_size
+        )
+        if len(vision_item_counts) != batch_size:
+            raise ValueError(
+                "num_vision_items_per_sample must align with the packed batch: "
+                f"got {len(vision_item_counts)} counts for batch size {batch_size}."
+            )
+
+        num_views_per_vision_item: list[int] = []
+        frames_per_vision_item: list[int] = []
+        for sample_idx, num_vision_items in enumerate(vision_item_counts):
+            if num_vision_items <= 0:
+                raise ValueError(f"Vision item counts must be positive, got {vision_item_counts}.")
+            num_views_per_vision_item.extend([sample_n_views[sample_idx]] * num_vision_items)
+            frames_per_vision_item.extend([sample_frames_per_view[sample_idx]] * num_vision_items)
+        return num_views_per_vision_item, frames_per_vision_item
+
+    def _require_lidar_tokenizer(self) -> VideoTokenizerInterface:
+        """Return the LiDAR VAE, or say which config knob is missing."""
+        if self.tokenizer_lidar_gen is None:
+            raise ValueError(
+                "This batch carries a LiDAR stream, but no LiDAR tokenizer is loaded. "
+                "Set lidar_tokenizer and lidar_state_ch on the model config."
+            )
+        return self.tokenizer_lidar_gen
+
+    def _normalize_uint8_vision_item(self, state: torch.Tensor) -> torch.Tensor:
+        """Convert one GPU-resident uint8 vision item to fp32 and normalize to ``[-1,1]``."""
+        return normalize_uint8_item(state, self.tensor_kwargs_fp32)
+
+    def _encode_vision_item(
+        self,
+        state: torch.Tensor,
+        *,
+        num_views: int,
+        frames_per_view: int | None,
+    ) -> torch.Tensor:  # state: [B,C,T,H,W] or [C,T,H,W], returns [...,C_latent,T_latent,H_latent,W_latent]
+        """Encode one vision item, normalizing camera-major views independently when requested.
+
+        When ``frames_per_view`` is present, ``state`` contains ``num_views``
+        complete clips concatenated along T. uint8 camera clips are converted to
+        fp32 and normalized per view so the full multiview tensor is never
+        materialized. Floating-point LiDAR clips (V0 range+intensity or V1 metric
+        three-channel) are already tokenizer-native and are encoded as-is.
+
+        Kept on the model rather than moved onto :class:`VisionEncoder` because it is a
+        monkeypatch seam: ``posttrain``'s seeded-validation context manager replaces this
+        attribute to give each vision item a deterministic RNG seed, so every unbalanced
+        encode has to keep flowing through it.
+        """
+        if frames_per_view is None:
+            if num_views != 1:
+                raise ValueError("frames_per_view is required when num_views is greater than one.")
+            return self.encode(state).contiguous().float()  # [...,C_latent,T_latent,H_latent,W_latent]
+
+        temporal_dim = state.ndim - 3
+        validate_multiview_length(state, num_views=num_views, frames_per_view=frames_per_view)
+
+        encoded_views: list[torch.Tensor] = []
+        for view_idx in range(num_views):
+            view_state = state.narrow(  # [...,C,T_v,H,W]
+                temporal_dim,
+                view_idx * frames_per_view,
+                frames_per_view,
+            )
+            # Camera pixels arrive as uint8 levels and need the [-1,1] map. A LiDAR
+            # clip arrives float in the units its own tokenizer normalizes from, so
+            # it is already tokenizer-native and is encoded as-is.
+            encode_input = (
+                view_state if torch.is_floating_point(view_state) else self._normalize_uint8_vision_item(view_state)
+            )  # [...,C,T_v,H,W]
+            encoded_view = self.encode(encode_input).contiguous().float()  # [...,C_latent,T_latent_v,H_latent,W_latent]
+            # The VAE is frozen/no-grad, so its output does not retain the
+            # encode input. Release this reference before the next view.
+            del encode_input
+            encoded_views.append(encoded_view)
+
+        # Do camera-major repacking for now (instead of timestamp-major).
+        return torch.cat(encoded_views, dim=temporal_dim)  # [...,C_latent,V*T_latent_v,H_latent,W_latent]
+
+    def _prepend_vision_pixel_prefixes(
+        self,
+        pixel_prefixes: list[torch.Tensor],
+        target_latents: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Encode each of four RGB memory anchors independently, then prepend.
+
+        Prefix pixels never enter the target clip's causal VAE call: otherwise
+        the four anchors collapse into fewer latent frames and contaminate the
+        future encoding. The caller supplies normalized float or uint8 RGB.
+        """
+        if len(pixel_prefixes) != len(target_latents):
+            raise ValueError("RGB memory must provide one four-frame prefix per target clip.")
+        combined = []
+        for prefix, target in zip(pixel_prefixes, target_latents, strict=True):
+            if isinstance(prefix, (list, tuple)) and len(prefix) == 1:
+                prefix = prefix[0]
+            if not isinstance(prefix, torch.Tensor) or prefix.ndim not in (4, 5):
+                raise ValueError("RGB memory must have shape [C,4,H,W] or [1,C,4,H,W].")
+            if prefix.ndim == 4:
+                prefix = prefix.unsqueeze(0)
+            if prefix.shape[0] != 1 or prefix.shape[1] != 3 or prefix.shape[2] != 4:
+                raise ValueError("Exact block rollout requires four RGB memory frames per sample.")
+            if not torch.is_floating_point(prefix):
+                prefix = self._normalize_uint8_vision_item(prefix)
+            memory = []
+            for frame_index in range(4):
+                anchor = self._encode_vision_item(
+                    prefix[:, :, frame_index : frame_index + 1], num_views=1, frames_per_view=None
+                )
+                if anchor.ndim != 5 or anchor.shape[2] != 1:
+                    raise ValueError("Exact block rollout requires each RGB anchor to encode into exactly one latent frame.")
+                if anchor.shape[:2] != target.shape[:2] or anchor.shape[3:] != target.shape[3:]:
+                    raise ValueError("RGB memory and future latents must have the same channels and spatial shape.")
+                memory.append(anchor)
+            combined.append(torch.cat([*memory, target], dim=2))
+        return combined
+
+    def _vision_encoder(self) -> VisionEncoder:
+        """Build the encoder for the current tokenizer, mesh and encode entry point.
+
+        Built per use rather than cached in ``__init__``: ``tokenizer_vision_gen`` and
+        ``parallel_dims`` are both assigned after construction, and ``IterSpeed`` installs a
+        ``MethodTimer`` over ``self.encode`` mid-run. Re-reading them here keeps the encoder
+        from pinning a stale collaborator, and costs nothing next to a VAE encode.
+        """
+        return VisionEncoder(
+            tokenizer=self.tokenizer_vision_gen,
+            parallel_dims=self.parallel_dims,
+            encode_fn=lambda state: self.encode(state),
+            fp32_kwargs=self.tensor_kwargs_fp32,
+        )
+
     def _encode_vision_x0_tokens(
         self,
         raw_state_vision: list[torch.Tensor],
         num_vision_items_per_sample: list[int] | None,
         vision_condition_indexes: list[list[int]] | None,
+        num_views_per_vision_item: list[int] | None = None,
+        frames_per_vision_item: list[int] | None = None,
+        balance_vae_encode: bool = False,
     ) -> list[torch.Tensor]:
-        """Encode vision items into x0 latent tokens, optionally skipping unused frames.
+        """Encode vision items into x0 latent tokens, optionally splitting camera views.
 
         Default behavior (``vision_condition_indexes is None``) encodes every pixel
         frame of every vision item. This is the path used during training and by any
-        caller that does not opt in, and it is byte-for-byte the original encode loop.
+        caller that does not opt in. Multiview items are camera-major along the raw
+        temporal axis; each camera is normalized and encoded independently before
+        its latent sequence is concatenated back in the same camera-major order.
 
         Inference optimization: when ``vision_condition_indexes`` is provided (one
         conditioning-frame-index list per sample, from each ``SequencePlan``) and the
@@ -2909,30 +4484,71 @@ class OmniMoTModel(ImaginaireModel):
         blend discards, so they are zero-filled instead of encoded. Under a causal VAE
         the kept latents are identical to the corresponding frames of a full-clip
         encode, while the encode processes far fewer frames (e.g. 1 pixel frame instead
-        of the full clip for policy / forward-dynamics modes that only condition latent
+        of the full clip for WAM / forward-dynamics modes that only condition latent
         frame 0). Inverse-dynamics conditions every latent frame, so it keeps the full
         encode automatically.
 
         The optimization falls back to a full encode for multi-vision samples,
-        non-causal tokenizers, samples with no conditioning frames, and any item whose
-        full clip is already the minimal prefix.
+        multiview items, non-causal tokenizers, samples with no conditioning frames,
+        and any item whose full clip is already the minimal prefix.
+
+        ``balance_vae_encode`` spreads the full-encode path's work across the ``lb`` group
+        (see :meth:`VisionEncoder.encode_balanced`). It is ignored on the prefix-encode path above,
+        which is inference-only, and only training opts in.
         """
 
-        def _full_encode(state: torch.Tensor) -> torch.Tensor:
-            return self.encode(state).contiguous().float()
+        has_multiview_metadata = num_views_per_vision_item is not None
+        if has_multiview_metadata != (frames_per_vision_item is not None):
+            raise ValueError("num_views_per_vision_item and frames_per_vision_item must be provided together.")
+        if num_views_per_vision_item is None:
+            num_views_per_vision_item = [1] * len(raw_state_vision)
+            frames_per_vision_item_optional: list[int | None] = [None] * len(raw_state_vision)
+        else:
+            assert frames_per_vision_item is not None
+            if len(num_views_per_vision_item) != len(raw_state_vision) or len(frames_per_vision_item) != len(
+                raw_state_vision
+            ):
+                raise ValueError(
+                    "Multiview VAE metadata must align with flattened vision items: "
+                    f"got {len(num_views_per_vision_item)} view counts, {len(frames_per_vision_item)} frame "
+                    f"counts, and {len(raw_state_vision)} vision items."
+                )
+            frames_per_vision_item_optional = list(frames_per_vision_item)
 
         # Only opt in when a caller supplied per-sample conditioning indexes, the
-        # samples map 1:1 to vision items (no multi-vision flattening), and the
-        # tokenizer is causal (so a pixel prefix reproduces the leading latents).
+        # samples map 1:1 to single-view vision items (no multi-vision flattening),
+        # and the tokenizer is causal (so a pixel prefix reproduces the leading latents).
         optimization_applicable = (
             vision_condition_indexes is not None
             and num_vision_items_per_sample is None
+            and not has_multiview_metadata
+            and all(num_views == 1 for num_views in num_views_per_vision_item)
             and self.tokenizer_vision_gen is not None
             and self.tokenizer_vision_gen.is_causal
             and len(vision_condition_indexes) == len(raw_state_vision)
         )
         if not optimization_applicable:
-            return [_full_encode(raw_state_vision_i) for raw_state_vision_i in raw_state_vision]
+            # Training does not provide vision_condition_indexes, so it fully
+            # encodes each item in the flattened control/target list.
+            if balance_vae_encode:
+                # Built only here: callers that never balance (inference, the visualization
+                # callbacks) should not need a tokenizer or an lb mesh to encode.
+                encoder = self._vision_encoder()
+                if encoder.balancing_available():
+                    return encoder.encode_balanced(
+                        raw_state_vision,
+                        num_views_per_vision_item,
+                        frames_per_vision_item_optional,
+                    )
+            return [
+                self._encode_vision_item(state, num_views=num_views, frames_per_view=frames_per_view)
+                for state, num_views, frames_per_view in zip(
+                    raw_state_vision,
+                    num_views_per_vision_item,
+                    frames_per_vision_item_optional,
+                    strict=True,
+                )
+            ]
 
         # The prefix-encode optimization zero-fills the generated (pure-noise) latent
         # frames that the condition_mask blend later discards. That is only valid when
@@ -2948,7 +4564,11 @@ class OmniMoTModel(ImaginaireModel):
         tokenizer = self.tokenizer_vision_gen
         assert vision_condition_indexes is not None  # narrowed by optimization_applicable above
         x0_tokens_vision: list[torch.Tensor] = []
-        for raw_state_vision_i, condition_indexes in zip(raw_state_vision, vision_condition_indexes, strict=True):
+        for raw_state_vision_i, condition_indexes in zip(
+            raw_state_vision,
+            vision_condition_indexes,
+            strict=True,
+        ):
             # The temporal axis is the first of the trailing (T, H, W) dims for both the
             # [B, C, T, H, W] and [C, T, H, W] layouts the tokenizer accepts, and encode
             # preserves rank so the same index locates T in the latent output.
@@ -2960,22 +4580,37 @@ class OmniMoTModel(ImaginaireModel):
             if not valid_condition:
                 # No conditioning frames to preserve (e.g. fully generated T2V item):
                 # keep the full encode so behavior is unchanged for non-action items.
-                x0_tokens_vision.append(_full_encode(raw_state_vision_i))
+                x0_tokens_vision.append(self._encode_vision_item(raw_state_vision_i, num_views=1, frames_per_view=None))
                 continue
 
             needed_latent_frames = max(valid_condition) + 1
             needed_pixel_frames = tokenizer.get_pixel_num_frames(needed_latent_frames)
+            if needed_pixel_frames <= 0 or tokenizer.get_latent_num_frames(needed_pixel_frames) != needed_latent_frames:
+                # Some causal tokenizers prepend enough checkpoint-native
+                # context that no positive pixel prefix produces exactly the
+                # requested leading latent count. Preserve correctness by
+                # encoding the full item; the condition mask still keeps only
+                # the declared clean latent indexes. In particular, DCAE maps
+                # one observed image to two latent slots, but slot 1 is causal
+                # padding that remains generated rather than a second clean
+                # observation, so its condition indexes intentionally stay [0].
+                x0_tokens_vision.append(self._encode_vision_item(raw_state_vision_i, num_views=1, frames_per_view=None))
+                continue
             assert needed_pixel_frames <= num_pixel_frames, (
                 f"needed_pixel_frames ({needed_pixel_frames}) cannot be greater than "
                 f"num_pixel_frames ({num_pixel_frames})"
             )
             if needed_pixel_frames == num_pixel_frames:
                 # The conditioning already spans (nearly) the whole clip; no work saved.
-                x0_tokens_vision.append(_full_encode(raw_state_vision_i))
+                x0_tokens_vision.append(self._encode_vision_item(raw_state_vision_i, num_views=1, frames_per_view=None))
                 continue
 
-            prefix = raw_state_vision_i.narrow(temporal_dim, 0, needed_pixel_frames)
-            prefix_latent = _full_encode(prefix)  # leading latent frames, causally exact
+            prefix = raw_state_vision_i.narrow(temporal_dim, 0, needed_pixel_frames)  # [...,T_prefix,H,W]
+            prefix_latent = self._encode_vision_item(  # [...,T_latent_prefix,H_latent,W_latent]
+                prefix,
+                num_views=1,
+                frames_per_view=None,
+            )
 
             # The scatter below assumes the pixel->latent round trip is exact, i.e. that
             # encoding ``needed_pixel_frames`` yields exactly ``needed_latent_frames``
@@ -3004,8 +4639,9 @@ class OmniMoTModel(ImaginaireModel):
     def get_data_and_condition(
         self,
         data_batch: dict[str, torch.Tensor],
-        iteration: int = 1,
         vision_condition_indexes: list[list[int]] | None = None,
+        retain_raw_state_vision: bool = True,
+        balance_vae_encode: bool = False,
     ) -> GenerationDataClean:
         """
         - Get raw data of different modalities from databatch
@@ -3014,7 +4650,6 @@ class OmniMoTModel(ImaginaireModel):
 
         Args:
             data_batch: Raw data batch from the dataloader.
-            iteration: Current iteration (only used for time-based logging during training).
             vision_condition_indexes: Optional per-sample list of conditioning latent
                 frame indexes (one list per sample, taken from each ``SequencePlan``).
                 When provided (inference only), it enables the causal-VAE prefix-encode
@@ -3022,7 +4657,20 @@ class OmniMoTModel(ImaginaireModel):
                 frames which only feed generated (non-conditioned) latent positions.
                 Leaving it ``None`` (the default, used during training) encodes every
                 frame — the original behavior.
+            retain_raw_state_vision: Preserve the public normalized
+                ``[B,C,V*T,H,W]`` raw-state contract for multiview sampling and
+                inference. Training disables this to avoid materializing complete
+                normalized multiview inputs.
+            balance_vae_encode: Spread this step's VAE-encode compute across the ``lb``
+                group instead of encoding exactly this rank's own pixels (see
+                ``VisionEncoder.encode_balanced``). Produces identical latents either way; only
+                where each encode runs changes. Off by default because it runs collectives
+                over the whole group: only training, which every rank enters in lockstep,
+                may turn it on.
         """
+        if not self._has_vision_stream(data_batch):
+            return self._get_lidar_only_data_and_condition(data_batch)
+
         # Detect whether any sample has multiple vision items (e.g. image editing).
         # If so, track the count per sample before all vision items from this batch are flattened into a list.
         is_image_batch = self.is_image_batch(data_batch)
@@ -3045,14 +4693,16 @@ class OmniMoTModel(ImaginaireModel):
             # visualization callbacks.
             data_batch["num_vision_items_per_sample"] = num_vision_items_per_sample
 
-            # if has_multiple_vision_per_sample, this means that the input media is a list of lists of tensors, we need to flatten it to a list of tensors
+            # if has_multiple_vision_per_sample, this means that the input media is a list
+            # of lists of tensors, we need to flatten it to a list of tensors
             if has_multiple_vision_per_sample:
                 media_key = self.input_video_key if not is_image_batch else self.input_image_key
                 data_batch[media_key] = [item.unsqueeze(0) for sublist in sample_vision_list for item in sublist]
                 if data_batch[media_key][0].dtype == torch.float32 and not is_image_batch:
-                    data_batch["is_preprocessed"] = (
-                        True  # for video batch, is_processed = True means the video data is normalized. However, for the image batch, is_processed = True means the image data is augmented with a temporal dimension.
-                    )
+                    # For video batch, is_preprocessed = True means the video data is normalized.
+                    # For the image batch, is_preprocessed = True means the image data is
+                    # normalized and augmented with a temporal dimension.
+                    data_batch["is_preprocessed"] = True
         else:
             num_vision_items_per_sample = data_batch["num_vision_items_per_sample"]
 
@@ -3060,40 +4710,102 @@ class OmniMoTModel(ImaginaireModel):
             len(sample_vision_list) if num_vision_items_per_sample is None else len(num_vision_items_per_sample)
         )
 
-        log_enc_time = False
-        timer = None
-        if TRAINING:
-            import wandb
+        num_views_per_vision_item, frames_per_vision_item = self._get_multiview_vae_metadata(
+            data_batch,
+            num_vision_items_per_sample,
+            batch_size,
+        )
 
-            log_enc_time = iteration % self.log_enc_time_every_n == 0 and wandb.run
-            if log_enc_time:
-                timer = Timer(unit="s")
-                timer.start()
+        # Vision (image/video) raw state and tokenized latent state.
+        media_key = self.input_image_key if is_image_batch else self.input_video_key
+        if num_views_per_vision_item is None:
+            # Legacy VFM/image path: normalize the complete input when needed and
+            # preserve the existing image batch-dimension handling.
+            self._normalize_video_databatch_inplace(data_batch)
+            self._augment_image_dim_inplace(data_batch)  # converts each image tensor to [1,C,1,H,W]
+            raw_state_vision = data_batch[media_key]
 
-        # Vision (image/video) raw state and tokenized latent state
-        self._normalize_video_databatch_inplace(data_batch)
-        self._augment_image_dim_inplace(data_batch)  # converts each image tensor to (1, C, 1, H, W)
-        raw_state_vision = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
+        else:
+            # Per-camera multiview path: preserve camera-major uint8 pixels here;
+            # _encode_vision_item normalizes only one camera at a time.
+            raw_state_vision = []
+            for item in data_batch[media_key]:
+                if isinstance(item, (list, tuple)):
+                    if len(item) != 1:
+                        raise ValueError(
+                            f"Single-item multiview samples must contain exactly one vision tensor, got {len(item)}."
+                        )
+                    item = item[0]
+                if not isinstance(item, torch.Tensor):
+                    raise TypeError(f"Multiview vision items must be tensors, got {type(item).__name__}.")
+                if item.dim() == 4:  # Unbatched camera-major pixels: [C,V*T,H,W]
+                    item = item.unsqueeze(0)  # [1,C,V*T,H,W]
+                elif item.dim() != 5:  # Batched camera-major pixels: [B,C,V*T,H,W]
+                    raise ValueError(
+                        f"Multiview vision items must have shape [C,V*T,H,W] or [B,C,V*T,H,W], got {tuple(item.shape)}."
+                    )
+                raw_state_vision.append(item)
+
+        pixel_prefixes = data_batch.get("vision_pixel_prefixes")
+        prefix_counts = [plan.vision_prefix_frame_count for plan in data_batch.get("sequence_plan", [])]
+        if pixel_prefixes is not None:
+            if len(prefix_counts) != batch_size or any(count != 4 for count in prefix_counts):
+                raise ValueError("RGB memory prefixes require an explicit four-slot sequence plan for every sample.")
+        elif any(prefix_counts):
+            raise ValueError("A block rollout memory sequence plan requires vision_pixel_prefixes; future frames are not memory.")
+        if pixel_prefixes is not None and (
+            num_vision_items_per_sample is not None
+            or (num_views_per_vision_item is not None and any(n != 1 for n in num_views_per_vision_item))
+        ):
+            raise ValueError("Exact block rollout RGB memory supports one single-view target clip per sample.")
         x0_tokens_vision = self._encode_vision_x0_tokens(
             raw_state_vision,
             num_vision_items_per_sample,
-            vision_condition_indexes,
+            # block rollout's clean indexes belong to separately encoded memory. They must
+            # never activate prefix-encoding of the wholly generated target.
+            None if pixel_prefixes is not None else vision_condition_indexes,
+            num_views_per_vision_item,
+            frames_per_vision_item,
+            balance_vae_encode=balance_vae_encode,
         )
-
-        frame_size = data_batch.get("image_size", None)
-        if frame_size is not None:
-            x0_tokens_vision = self._remove_padding_from_latent(x0_tokens_vision, frame_size)
 
         temporal_positions_vision = self._get_temporal_positions_vision(
             raw_state_vision=raw_state_vision,
             x0_tokens_vision=x0_tokens_vision,
+            num_views_per_vision_item=num_views_per_vision_item,
+            frames_per_vision_item=frames_per_vision_item,
         )
+        if pixel_prefixes is not None:
+            if temporal_positions_vision is not None:
+                raise ValueError("Exact block rollout RGB memory requires ordinal latent positions.")
+            x0_tokens_vision = self._prepend_vision_pixel_prefixes(pixel_prefixes, x0_tokens_vision)
+
+        # Apply the same spatial crop to independently encoded memory and target.
+        frame_size = data_batch.get("image_size", None)
+        if frame_size is not None:
+            x0_tokens_vision = self._remove_padding_from_latent(x0_tokens_vision, frame_size)
+
+        # LiDAR range clips: their own VAE, so they never travel among the vision items.
+        raw_state_lidar, x0_tokens_lidar, num_lidar_items_per_sample = self._encode_lidar_stream(data_batch, batch_size)
+
+        output_raw_state_vision = raw_state_vision
+        if retain_raw_state_vision and num_views_per_vision_item is not None:
+            # Camera pixels arrive as uint8 levels and need the [-1,1] map. An item that is
+            # already floating point has been normalized by whoever produced it, and running
+            # the level map over it a second time would misread its units.
+            output_raw_state_vision = [
+                state if torch.is_floating_point(state) else self._normalize_uint8_vision_item(state)
+                for state in raw_state_vision
+            ]  # list[[B,C,V*T,H,W]]
 
         # Action – extract dense action / domain_id without mutating data_batch,
         # so downstream callbacks can still read the original per-sample domain_ids.
-        raw_state_action, action_domain_id = self._normalize_action_databatch(data_batch)
+        raw_state_action, action_domain_id, action_family, action_contract_id, action_layout_id = (
+            self._normalize_action_databatch(data_batch)
+        )
         x0_tokens_action = raw_state_action
         raw_action_dim = data_batch.get("raw_action_dim", None)
+        action_valid_mask = data_batch.get("action_valid_mask", None)
 
         # Sound/audio - normalize, encode if present and sound_gen is enabled
         self._normalize_sound_databatch_inplace(data_batch)
@@ -3118,6 +4830,14 @@ class OmniMoTModel(ImaginaireModel):
                 fps_action_raw = torch.stack(fps_action_raw).flatten()
             fps_action = fps_action_raw.to(**self.tensor_kwargs)
 
+        # LiDAR sweep rate for mRoPE, a property of the recording rather than of the clip, so
+        # it comes from the config the way the LiDAR VAE's compression does.
+        fps_lidar = None
+        if x0_tokens_lidar is not None:
+            fps_lidar = torch.full((batch_size,), float(self.config.lidar_fps), dtype=torch.float32).to(
+                **self.tensor_kwargs
+            )
+
         # Sound FPS for RoPE alignment (constant, from config)
         if x0_tokens_sound is not None:
             sound_batch_size = len(x0_tokens_sound)
@@ -3129,31 +4849,11 @@ class OmniMoTModel(ImaginaireModel):
         else:
             fps_sound = None
 
-        if TRAINING and log_enc_time and timer is not None:
-            timer.end()
-            elapsed = timer.get_cuda_time()
-            h, w = raw_state_vision[0].shape[-2], raw_state_vision[0].shape[-1]
-            resolution_label = "unknown"
-            for res_name, aspect_ratios in VIDEO_RES_SIZE_INFO.items():
-                if (h, w) in aspect_ratios.values():
-                    resolution_label = res_name
-                    if res_name == "704":
-                        # 720 shares some aspect ratios with 704 (e.g., 1:1 at 960x960); prefer 720.
-                        if (h, w) in VIDEO_RES_SIZE_INFO.get("720", {}).values():
-                            resolution_label = "720"
-                    break
-            wandb.log(
-                {
-                    f"timer/encoding_{resolution_label}p": elapsed,
-                    "timer/encoding": elapsed,
-                },
-                step=iteration,
-            )
         control_weights: list[list[float]] | None = data_batch.get("control_weights", None)
         return GenerationDataClean(
             batch_size=batch_size,
             is_image_batch=is_image_batch,
-            raw_state_vision=raw_state_vision,
+            raw_state_vision=output_raw_state_vision,
             raw_state_action=raw_state_action,
             raw_state_sound=raw_state_sound,
             x0_tokens_vision=x0_tokens_vision,
@@ -3164,14 +4864,130 @@ class OmniMoTModel(ImaginaireModel):
             fps_action=fps_action,
             fps_sound=fps_sound,
             action_domain_id=action_domain_id,
+            action_contract_id=action_contract_id,
+            action_layout_id=action_layout_id,
+            action_family=action_family,
             num_vision_items_per_sample=num_vision_items_per_sample,
+            num_views_per_vision_item=num_views_per_vision_item,
+            raw_state_lidar=raw_state_lidar,
+            x0_tokens_lidar=x0_tokens_lidar,
+            fps_lidar=fps_lidar,
+            num_lidar_items_per_sample=num_lidar_items_per_sample,
             raw_action_dim=raw_action_dim,
+            action_valid_mask=action_valid_mask,
             control_weights=control_weights,
         )
 
-    def _normalize_video_databatch_inplace(
-        self, data_batch: dict[str, torch.Tensor], input_key: str | None = None
-    ) -> None:
+    def _has_vision_stream(self, data_batch: dict[str, Any]) -> bool:
+        """Whether the batch carries a camera stream to tokenize.
+
+        The LiDAR-only AV recipe decodes no camera at all, so it arrives with neither the
+        image nor the video key and its sole generated stream is ``lidar``.
+        """
+        return self.input_image_key in data_batch or self.input_video_key in data_batch
+
+    def _get_lidar_only_data_and_condition(self, data_batch: dict[str, Any]) -> GenerationDataClean:
+        """Build the clean payload for a batch whose only generated stream is LiDAR.
+
+        ``batch_size`` comes from the LiDAR stream because there are no vision items to count.
+        The vision fields are empty rather than absent, and every sample is recorded as owning
+        zero vision items, so the packer, the noise schedule and the loss walk the vision
+        stream the same way they walk any other batch -- over nothing, in this case.
+        """
+        lidar_entries = data_batch.get("lidar")
+        if lidar_entries is None:
+            raise ValueError(
+                "A batch with no vision stream must carry a LiDAR stream: found neither "
+                f"{self.input_video_key!r}/{self.input_image_key!r} nor 'lidar'."
+            )
+        num_lidar_items_per_sample = data_batch.get("num_lidar_items_per_sample", None)
+        batch_size = len(num_lidar_items_per_sample) if num_lidar_items_per_sample is not None else len(lidar_entries)
+
+        raw_state_lidar, x0_tokens_lidar, num_lidar_items = self._encode_lidar_stream(data_batch, batch_size)
+        # The sweep rate is a property of the recording rather than of the clip, so it comes
+        # from the config the way the LiDAR VAE's compression does.
+        fps_lidar = torch.full((batch_size,), float(self.config.lidar_fps), dtype=torch.float32).to(
+            **self.tensor_kwargs
+        )
+        return GenerationDataClean(
+            batch_size=batch_size,
+            is_image_batch=False,
+            raw_state_vision=[],
+            x0_tokens_vision=[],
+            num_vision_items_per_sample=[0] * batch_size,
+            raw_state_lidar=raw_state_lidar,
+            x0_tokens_lidar=x0_tokens_lidar,
+            fps_lidar=fps_lidar,
+            num_lidar_items_per_sample=num_lidar_items,
+            control_weights=data_batch.get("control_weights", None),
+        )
+
+    def _encode_lidar_stream(
+        self,
+        data_batch: dict[str, Any],
+        batch_size: int,
+    ) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None, list[int] | None]:
+        """Encode the batch's LiDAR range clips into x0 latent tokens.
+
+        ``data_batch["lidar"]`` arrives from the loader as one entry per sample — a list of
+        tokenizer-native range clips — and is flattened here the way the vision key is. Both
+        tokenizer versions receive the same layout, metric range with unit intensity and a
+        validity mask, and normalize it inside encode; only the azimuth canvas differs. The
+        tokenizer owns that layout. The per-sample counts
+        are written back to the batch, both so a second pass over the same batch sees the
+        flat form and so the visualization callbacks can regroup the items once the
+        training payload is gone.
+
+        Returns:
+            The raw range clips, their latents, and the per-sample item counts; all
+            ``None`` when the batch carries no LiDAR.
+        """
+        raw = data_batch.get("lidar", None)
+        if raw is None:
+            return None, None, None
+
+        num_lidar_items_per_sample = data_batch.get("num_lidar_items_per_sample", None)
+        if num_lidar_items_per_sample is None:
+            # Per-sample form: group the items and record the counts.
+            if len(raw) != batch_size:
+                raise ValueError(f"The LiDAR stream needs one entry per sample: got {len(raw)} for {batch_size}.")
+            grouped = [list(entry) if isinstance(entry, (list, tuple)) else [entry] for entry in raw]
+            num_lidar_items_per_sample = [len(items) for items in grouped]
+            flat_items = [item for items in grouped for item in items]
+        else:
+            # Flat form: already grouped on an earlier pass over this batch.
+            num_lidar_items_per_sample = [int(count) for count in num_lidar_items_per_sample]
+            flat_items = list(raw)
+            if len(num_lidar_items_per_sample) != batch_size:
+                raise ValueError(
+                    "num_lidar_items_per_sample must have one count per sample: "
+                    f"got {len(num_lidar_items_per_sample)} counts for batch size {batch_size}."
+                )
+            if len(flat_items) != sum(num_lidar_items_per_sample):
+                raise ValueError(
+                    "LiDAR items must match num_lidar_items_per_sample: "
+                    f"got {len(flat_items)} items for {sum(num_lidar_items_per_sample)} expected."
+                )
+
+        raw_state_lidar: list[torch.Tensor] = []
+        for item in flat_items:
+            if not isinstance(item, torch.Tensor):
+                raise TypeError(f"LiDAR items must be tensors, got {type(item).__name__}.")
+            if item.dim() == 4:  # [C,T,H,W]
+                item = item.unsqueeze(0)  # [1,C,T,H,W]
+            elif item.dim() != 5:
+                raise ValueError(f"LiDAR items must have shape [C,T,H,W] or [B,C,T,H,W], got {tuple(item.shape)}.")
+            if not torch.is_floating_point(item):
+                raise TypeError(f"LiDAR range maps must arrive as floating-point clips, got {item.dtype}.")
+            raw_state_lidar.append(item.to(**self.tensor_kwargs_fp32))  # [1,C,T,H,W]
+
+        data_batch["lidar"] = raw_state_lidar
+        data_batch["num_lidar_items_per_sample"] = num_lidar_items_per_sample
+
+        x0_tokens_lidar = [self.encode_lidar(state).contiguous().float() for state in raw_state_lidar]
+        return raw_state_lidar, x0_tokens_lidar, num_lidar_items_per_sample
+
+    def _normalize_video_databatch_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
         """
         Normalizes video data in-place on a CUDA device to reduce data loading overhead.
 
@@ -3181,8 +4997,6 @@ class OmniMoTModel(ImaginaireModel):
         Args:
             data_batch (dict[str, Tensor]): A dictionary containing the video data under a specific key.
                 This tensor is expected to be on a CUDA device and have dtype of torch.uint8.
-            input_key (str | None): The key for the video tensor in the data_batch. Defaults to
-                `self.input_video_key` if not provided.
 
         Side Effects:
             Modifies the tensor at `input_key` within `data_batch` in-place.
@@ -3193,7 +5007,7 @@ class OmniMoTModel(ImaginaireModel):
             and has the correct dtype (torch.uint8) to avoid unexpected behaviors.
         """
         IS_PREPROCESSED_KEY = "is_preprocessed"
-        input_key = self.input_video_key if input_key is None else input_key
+        input_key = self.input_video_key
         # only handle video batch
         if input_key in data_batch:
             if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
@@ -3204,18 +5018,39 @@ class OmniMoTModel(ImaginaireModel):
                         f"[{data_batch[input_key][i].min()}, {data_batch[input_key][i].max()}]"
                     )
             else:
+                # Worker-normalized batches take the preprocessed branch above.
+                normalize_kwargs = (  # configs written before the switch normalize in fp32
+                    self.tensor_kwargs
+                    if getattr(self.config, "normalize_video_in_model_dtype", False)
+                    else self.tensor_kwargs_fp32
+                )
                 for i in range(len(data_batch[input_key])):
                     item = data_batch[input_key][i]
                     if isinstance(item, torch.Tensor):
-                        item = [item]
-                    assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
-                    data_batch[input_key][i] = torch.stack(item).to(**self.tensor_kwargs_fp32) / 127.5 - 1.0
+                        assert item.dtype == torch.uint8, "Video data is not in uint8 format."
+                        # Flattened multiview items already include B; preserve the original stacking behavior otherwise.
+                        if item.ndim != 5:
+                            item = torch.stack([item])  # [1,C,T,H,W]
+                        normalized_item = item.to(**normalize_kwargs) / 127.5 - 1.0  # [B,C,T,H,W]
+                    else:
+                        # Non-flattened batches may still provide one [C,T,H,W] tensor per sample.
+                        assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
+                        normalized_item = (  # [B,C,T,H,W]
+                            torch.stack(item).to(**normalize_kwargs) / 127.5 - 1.0
+                        )
+                    data_batch[input_key][i] = normalized_item  # [B,C,T,H,W]
                 data_batch[IS_PREPROCESSED_KEY] = True
 
     def _normalize_action_databatch(
         self, data_batch: dict[str, torch.Tensor]
-    ) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None]:
-        """Extract dense action and domain_id lists from the data batch.
+    ) -> tuple[
+        list[torch.Tensor] | None,
+        list[torch.Tensor] | None,
+        list[str] | None,
+        list[torch.Tensor] | None,
+        list[torch.Tensor] | None,
+    ]:
+        """Extract aligned action, domain, family, contract, and layout metadata.
 
         The joint dataloader produces action and domain_id data as
         ``[[tensor], [None], [tensor], ...]`` (each sample wrapped in a
@@ -3224,15 +5059,41 @@ class OmniMoTModel(ImaginaireModel):
         **without mutating** ``data_batch``.
 
         Returns:
-            (dense_action, dense_domain_id): Each is a list of device tensors
-            containing only non-None entries, or ``None`` if all entries are
-            ``None`` / the key is absent.
+            Dense action and domain-ID tensors plus dataset names aligned with
+            the non-None action rows. Missing or malformed telemetry metadata
+            produces ``None`` for the dataset names without affecting training.
         """
-        dense_action = unwrap_and_densify(data_batch.get("action", None), self.tensor_kwargs)
+        # Keep normalized actions in FP32 through flow interpolation so adding noise and computing
+        # the velocity target do not inherit BF16 quantization. The noisy encoder input is cast to
+        # model precision at the action encoder boundary in ``_encode_action``.
+        dense_action = unwrap_and_densify(data_batch.get("action", None), self.tensor_kwargs_fp32)
         dense_domain_id = unwrap_and_densify(
             data_batch.get("domain_id", None), {"device": self.tensor_kwargs["device"]}
         )
-        return dense_action, dense_domain_id
+        dense_action_family = (
+            _densify_action_family(data_batch.get("action"), data_batch.get("_action_family"), len(dense_action))
+            if dense_action is not None
+            else None
+        )
+        dense_action_contract_id = _densify_action_contract_ids(
+            data_batch.get("action"),
+            data_batch.get("action_contract_id"),
+            {"device": self.tensor_kwargs["device"]},
+            raw_conditioning_contract_ids=data_batch.get("action_conditioning_contract_id"),
+            raw_plans=data_batch.get("sequence_plan"),
+        )
+        raw_layout_ids = data_batch.get("action_layout_id")
+        if raw_layout_ids is None:
+            raw_layout_ids = _layout_names_to_ids(data_batch.get("action_layout", data_batch.get("action_layout_name")))
+        dense_action_layout_id = _densify_action_contract_ids(
+            data_batch.get("action"),
+            raw_layout_ids,
+            {"device": self.tensor_kwargs["device"]},
+            raw_plans=data_batch.get("sequence_plan"),
+        )
+        if self.config.semantic_projectors and dense_action_contract_id is not None and dense_action_layout_id is None:
+            raise ValueError("Semantic GreenWAM actions require action_layout_id for every action sample")
+        return dense_action, dense_domain_id, dense_action_family, dense_action_contract_id, dense_action_layout_id
 
     def _normalize_sound_databatch_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
         """Flatten and densify nested sound lists in-place.
@@ -3328,20 +5189,19 @@ class OmniMoTModel(ImaginaireModel):
         else:
             data_batch["sound"] = raw_state_sound
 
-    def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:
+    def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
         """
         Augments image tensors by adding a temporal dimension (B, C, H, W) -> (B, C, 1, H, W).
 
         Args:
             data_batch (dict[str, Tensor]): A dictionary containing the image data.
-            input_key (str | None): The key for the image tensor. Defaults to `self.input_image_key`.
 
         Side Effects:
             Modifies the tensor at `input_key` within `data_batch` in-place.
         """
         IS_PREPROCESSED_KEY = "is_preprocessed"
 
-        input_key = self.input_image_key if input_key is None else input_key
+        input_key = self.input_image_key
         if input_key in data_batch:
             # Check if the data has already been augmented and avoid re-augmenting
             if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
@@ -3541,6 +5401,16 @@ class OmniMoTModel(ImaginaireModel):
         """
         is_image = self.input_image_key in data_batch
         is_video = self.input_video_key in data_batch
+        if not (is_image or is_video):
+            # The LiDAR-only recipe decodes no camera, so it carries neither key and this is not
+            # an image batch. Require its dedicated stream here so a corrupted camera batch that
+            # lost its media key still fails at the original classification boundary.
+            if "lidar" not in data_batch:
+                raise ValueError(
+                    "A batch must carry exactly one camera stream or the dedicated LiDAR stream; "
+                    f"found neither {self.input_image_key!r}, {self.input_video_key!r}, nor 'lidar'."
+                )
+            return False
         assert is_image != is_video, (
             "Only one of the input_image_key or input_video_key should be present in the data_batch."
         )
@@ -3844,6 +5714,7 @@ class OmniMoTModel(ImaginaireModel):
         net: torch.nn.Module | None = None,
         data_batch_packed: PackedSequence | None = None,
         memory: MemoryState | None = None,
+        video_temporal_causal: bool | None = None,
     ) -> dict:
         """
         Runs the MoT network on a packed multi-modal sequence to predict velocity (v) targets.
@@ -3852,10 +5723,14 @@ class OmniMoTModel(ImaginaireModel):
             data_batch_packed: PackedSequence from `pack_input_sequence(...)`.
             memory: Optional pre-built MemoryState for autoregressive generation
                 or KV-cache training.
+            video_temporal_causal: Per-call attention-mode override forwarded to
+                ``Cosmos3VFMNetwork.forward``; ``None`` (default) keeps the
+                config-selected mode.
 
         Returns:
             dict containing:
                 - "preds_vision": list[Tensor[C,T,H,W]], one per sample.
+                - "preds_lidar": Velocity prediction for the LiDAR stream (if the network carries it).
                 - "preds_action": Velocity prediction for action modality (if action_gen enabled).
                 - "preds_sound": Velocity prediction for sound modality (if sound_gen enabled).
                 - "lbl_metadata_und": Load balancing metadata for understanding pathway (if present).
@@ -3865,9 +5740,12 @@ class OmniMoTModel(ImaginaireModel):
         out_net = net(
             packed_seq=data_batch_packed,
             memory=memory,
+            video_temporal_causal=video_temporal_causal,
         )
         output_dict = dict()
         output_dict["preds_vision"] = out_net["preds_vision"]
+        if "preds_lidar" in out_net:
+            output_dict["preds_lidar"] = out_net["preds_lidar"]
         if self.config.action_gen and "preds_action" in out_net:
             output_dict["preds_action"] = out_net["preds_action"]
         if self.config.sound_gen and "preds_sound" in out_net:
@@ -4654,6 +6532,22 @@ class OmniMoTModel(ImaginaireModel):
         return self.tokenizer_vision_gen.decode(latent)
 
     @torch.no_grad()
+    def encode_lidar(self, state: torch.Tensor) -> torch.Tensor:
+        """Encode a LiDAR range clip with the LiDAR VAE."""
+        return self._require_lidar_tokenizer().encode(state)
+
+    @torch.no_grad()
+    def decode_lidar(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode LiDAR latents to range pixels with the LiDAR VAE.
+
+        The stream keeps its own VAE's channel count end to end, so a latent arrives here
+        at the width its decoder expects. Both tokenizer versions return metric range,
+        unit intensity, and a resolved mask, so the visualizers downstream never branch
+        on which one is configured.
+        """
+        return self._require_lidar_tokenizer().decode(latent)
+
+    @torch.no_grad()
     def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:
         """Encode audio waveform into latent tokens.
 
@@ -4755,6 +6649,68 @@ class OmniMoTModel(ImaginaireModel):
         init_lora_weights_post_materialization(network)
 
 
+def _get_master_dtype_and_mp_policy(
+    config: OmniMoTModelConfig, precision: torch.dtype
+) -> tuple[torch.dtype, MixedPrecisionPolicy | None]:
+    """Resolve the parameter storage dtype together with the FSDP2 policy that matches it.
+
+    These are decided in one place because they describe one arrangement from opposite ends:
+    the returned dtype is what ``nn.Parameter.data`` holds on each rank -- what the optimizer
+    steps and what the checkpoint stores -- while the policy is what FSDP2 casts to around it.
+    The parameters are generally kept in a higher-precision "master" dtype (FP32 by default)
+    and FSDP2 down-casts to ``precision`` for the forward/backward and the all-gather.
+
+    Three outcomes, in the order they are decided:
+
+    1. ``parallelism.enable_inference_mode`` collapses the master dtype to ``precision``, then
+       falls into case 2. With no optimizer to step a master copy and no gradient to reduce
+       into it, a higher-precision parameter only costs resident weight memory and an
+       all-gather down-cast per forward.
+    2. A master dtype equal to ``precision`` yields no policy: nothing is cast, and the
+       parameters are stored, computed with, and reduced in the compute dtype. This is the
+       pre-mixed-precision behaviour, and setting ``parallelism.fsdp_master_dtype`` to
+       ``precision`` is how to opt back out of mixed precision by hand.
+    3. Otherwise a policy casts to ``precision`` for compute and all-gather, and reduces
+       gradients in ``parallelism.fsdp_reduce_dtype``. Only parameters are cast; forward
+       inputs are left alone (see the comment on ``cast_forward_inputs`` below).
+
+    Args:
+        config: Read for ``parallelism.enable_inference_mode``, ``parallelism.fsdp_master_dtype``
+            and ``parallelism.fsdp_reduce_dtype``.
+        precision: The forward/backward compute dtype, i.e. ``MixedPrecisionPolicy.param_dtype``
+            -- ``OmniMoTModel.precision``, mapped from ``config.precision``.
+
+    Returns:
+        ``(master_dtype, mp_policy)``: the dtype to build and store the network's parameters in
+        (pass as ``build_net(dtype=...)``), and the policy to install on each FSDP unit, or
+        ``None`` to cast nothing. ``mp_policy`` is ``None`` exactly when ``master_dtype ==
+        precision``.
+    """
+    master_dtype = (
+        precision
+        if config.parallelism.enable_inference_mode
+        else PRECISION_TO_TORCH_DTYPE[config.parallelism.fsdp_master_dtype]
+    )
+    if master_dtype == precision:
+        mp_policy = None
+    else:
+        if config.parallelism.fsdp_reduce_dtype is None:
+            # Follow the master dtype so the reduced gradient lands in the dtype of the
+            # shard it writes back into, which is what the optimizer steps in place.
+            reduce_dtype = master_dtype
+        else:
+            reduce_dtype = PRECISION_TO_TORCH_DTYPE[config.parallelism.fsdp_reduce_dtype]
+        # ``cast_forward_inputs`` stays off because FSDP2 casts forward inputs with
+        # ``_apply_to_tensors``, which recurses into dataclasses and rewrites every
+        # floating-point tensor it reaches. That reaches through ``PackedSequence`` into
+        # metadata that must keep its own dtype: FP32 rectified-flow timesteps and, under
+        # ``enable_fps_modulation``, FP32 mRoPE position ids -- neither survives BF16
+        # (positions near the modality margin round to multiples of 64). Activations are
+        # already handed to the network in ``precision``, so nothing needs the cast.
+        mp_policy = MixedPrecisionPolicy(param_dtype=precision, reduce_dtype=reduce_dtype, cast_forward_inputs=False)
+    return master_dtype, mp_policy
+
+
 def _broadcast_seed(seed: list[int], group: dist.ProcessGroup, rank: int) -> list[int]:
     if rank == 0:
         seed_tensor = torch.tensor(seed, dtype=torch.int64, device=DEVICE)  # [len(seed)]
@@ -4777,4 +6733,4 @@ def _is_reasoner_state_dict_key(key: str) -> bool:
     key = key.replace("_orig_mod.", "").replace("_checkpoint_wrapped_module.", "")
     if not key.startswith("language_model."):
         return False
-    return "_moe_gen" not in key
+    return "_moe_gen" not in key and "_action_expert" not in key  # the action expert is split off the gen tower

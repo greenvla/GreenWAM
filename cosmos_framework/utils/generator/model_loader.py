@@ -4,7 +4,9 @@
 import importlib
 import os
 import os.path as osp
+import pathlib
 import re
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -98,6 +100,11 @@ def _is_safetensors_checkpoint(checkpoint_path: str, credential_path: str | None
 def _is_checkpoint_cache_ready(checkpoint_path: str) -> bool:
     """Return True when FileSystemWriter has published its completion metadata."""
     return osp.isfile(osp.join(checkpoint_path, ".metadata"))
+
+
+def _install_pathlib_pickle_compat() -> None:
+    """Load DCP metadata written by Python versions that use ``pathlib._local``."""
+    sys.modules.setdefault("pathlib._local", pathlib)
 
 
 class _CheckpointCacheAction(IntEnum):
@@ -240,6 +247,7 @@ def _load_model(
         log.info("Dropping net_teacher.* keys from inference load target; distillation checkpoints do not save them.")
         state_dict = {key: value for key, value in state_dict.items() if not key.startswith("net_teacher.")}
 
+    _install_pathlib_pickle_compat()
     if checkpoint_path.startswith("s3://"):
         storage_reader = S3StorageReader(
             credential_path=credential_path or "",
@@ -345,8 +353,9 @@ def load_model_from_checkpoint(
             of quantization options (e.g. ``method``, ``include_regex``, ``exclude_regex``).
             Quantization is applied in-place on the model parameters. Only works when model
             sharding (FSDP) is disabled. When ``method`` resolves to ``None``,
-            quantization is disabled. Only Blackwell architectures are supported. Valid
-            quantization methods are ``nvfp4`` and ``mxfp8``.
+            quantization is disabled. ``mxfp8`` and ``nvfp4`` require Blackwell;
+            ``fp8`` also supports Hopper and Ada. Valid methods are ``fp8``,
+            ``mxfp8``, and ``nvfp4``.
         seed: Random seed used for initialization (if applicable).
         experiment_opts: Extra experiment/config override options.
         use_cache_checkpoint: If True, locally save & read remote checkpoints to speed up repeated loads.
@@ -400,7 +409,6 @@ def load_model_from_checkpoint(
 
     quantization_config_obj = QuantizationConfig(**quantization_config)
     quantization_method = quantization_config_obj.method
-
     if quantization_method is not None:
         dp_shard_degree = config.model.config.parallelism.data_parallel_shard_degree
         if dp_shard_degree > 1:

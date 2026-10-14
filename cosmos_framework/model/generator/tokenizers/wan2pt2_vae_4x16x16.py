@@ -4,9 +4,12 @@
 import os
 import time
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
+from typing import Literal
 
 import torch
+import torch._inductor
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -693,6 +696,8 @@ def count_conv3d(model: nn.Module) -> int:
 
 
 class WanVAE_(nn.Module):
+    output_range: str = "[-1,1]"
+
     def __init__(
         self,
         dim=160,
@@ -738,10 +743,23 @@ class WanVAE_(nn.Module):
             self.temperal_upsample,
             dropout,
         )
+        self._compiled_decoder_forward: Callable[..., torch.Tensor] | None = None
 
         self._enc_conv_num = count_conv3d(self.encoder)
         self._dec_conv_num = count_conv3d(self.decoder)
         self._dec_cache: list[torch.Tensor | None] = self._new_dec_cache()
+
+    def enable_decoder_compile(self) -> None:
+        """Enable static compilation for non-priming decoder slices."""
+        self._compiled_decoder_forward = torch.compile(
+            self.decoder.forward,
+            fullgraph=True,
+            dynamic=False,
+        )
+        log.info(
+            "Enabled static torch.compile for steady-state Wan VAE decoder slices",
+            rank0_only=False,
+        )
 
     def _new_enc_cache(self) -> list:
         """Fresh per-layer cache for the encoder (one slot per CausalConv3d)."""
@@ -863,11 +881,16 @@ class WanVAE_(nn.Module):
         # For T=1 (single image), latent_T=1.  For T=4n+1, latent_T=n+1.
         latent_T = 1 + (T - 1) // 4
 
-        # Certain short-clip durations (e.g. robotics datasets with T=17) can be
-        # encoded at their exact length, avoiding the overhead of padding to the
-        # next chunk boundary.  All other lengths are padded so that each chunk
-        # has exactly ``temporal_window`` frames, giving the compiled function a
-        # fixed input shape per {resolution, aspect_ratio} bucket.
+        # Certain short-clip durations (e.g. robotics datasets with T=17) can be pinned via
+        # ``encode_exact_durations`` to always encode at their exact length, unpadded. Every
+        # other length is padded up to the next full ``temporal_window`` boundary regardless
+        # of how small the remainder is, so every chunk dispatched to ``_run_chunk`` is
+        # always either the 1-frame prime or a full-size ``temporal_window`` chunk -- there is
+        # no third, remainder-sized shape to separately compile, benchmark, or predict for
+        # (except the exact-duration case, which is few enough values to enumerate
+        # explicitly; see ``compile_encode``'s ``encode_exact_durations`` handling). This
+        # trades a little wasted compute on the pad for a cost model with only two chunk
+        # shapes per resolution instead of an open-ended family of remainder sizes.
         should_pad = T not in self._encode_exact_durations
 
         if should_pad:
@@ -903,9 +926,16 @@ class WanVAE_(nn.Module):
             """
             is_prime = feat_cache[0] is None
 
-            # Ensure contiguity so AOT-compiled functions receive tensors
-            # with deterministic strides regardless of the source slice.
+            # Ensure contiguity so the encoder (eager or AOT-compiled) receives tensors with
+            # deterministic strides regardless of the source slice. This matters most for the
+            # AOT path: the compiled variants are exported against eager-produced (contiguous)
+            # example caches, but the cache returned by a previous AOT chunk is not guaranteed
+            # to share that layout (torch 2.12's AOTInductor returns a differently-strided
+            # cache). Feeding a non-canonical layout makes the compiled function misread it,
+            # silently corrupting subsequent chunks. It is a no-op for already-contiguous
+            # tensors, so applying it on both paths costs nothing and keeps the invariant local.
             x_chunk = x_chunk.contiguous()
+            feat_cache = [c.contiguous() if c is not None else None for c in feat_cache]
 
             if aot_chunk_fns is not None:
                 cache_t = 0 if is_prime else feat_cache[0].shape[2]
@@ -950,8 +980,13 @@ class WanVAE_(nn.Module):
         parts = []
         for i in range(x.shape[2]):
             first_chunk = (i == 0) and all(c is None for c in self._dec_cache)
+            decode_forward = (
+                self._compiled_decoder_forward
+                if self._compiled_decoder_forward is not None and not first_chunk
+                else self.decoder.forward
+            )
             parts.append(
-                self.decoder(
+                decode_forward(
                     x[:, :, i : i + 1],
                     feat_cache=self._dec_cache,
                     first_chunk=first_chunk,
@@ -966,6 +1001,10 @@ class WanVAE_(nn.Module):
 
     def clear_decoder_cache(self) -> None:
         self._dec_cache = self._new_dec_cache()
+
+    def get_output_range(self) -> str:
+        """Return the pixel-output range produced by the native Wan decoder."""
+        return self.output_range
 
 
 def _video_vae(
@@ -991,7 +1030,16 @@ def _video_vae(
         model.to_empty(device=device)
     else:
         if get_rank() == 0:
-            if not INTERNAL:
+            if pretrained_path.startswith("hf://"):
+                # easy_io has no 'hf' backend, so an hf:// URI must be resolved to a
+                # local file first. Do this regardless of INTERNAL (unlike s3:// paths,
+                # which are loaded directly from the object store in INTERNAL mode) so
+                # that HF-only checkpoints (e.g. Cosmos3-Edge) work without setting
+                # COSMOS_INTERNAL=0.
+                from cosmos_framework.utils.checkpoint_db import _download_hf_checkpoint
+
+                pretrained_path = _download_hf_checkpoint(pretrained_path)
+            elif not INTERNAL:
                 from cosmos_framework.utils.checkpoint_db import download_checkpoint_v2
 
                 pretrained_path = download_checkpoint_v2(pretrained_path)
@@ -1014,6 +1062,7 @@ def _video_vae(
             model.load_state_dict(ckpt, assign=TRAINING)
         else:
             model.to_empty(device=device)
+
     # Ensure all params/buffers are contiguous on every rank before
     # `sync_model_states` performs its shape+stride verification.
     # `assign=TRAINING` on rank 0 replaces params with loaded tensor objects,
@@ -1039,7 +1088,6 @@ class WanVAE:
         object_store_credential_path_pretrained="",
         dtype=torch.bfloat16,
         device=DEVICE,
-        is_amp=True,
         temporal_window: int | Mapping[str, int] = 4,
         encode_exact_durations: list[int] | None = None,
     ):
@@ -1162,12 +1210,9 @@ class WanVAE:
         )
 
         self.model = self.model.eval().requires_grad_(False)
-        self.is_amp = is_amp
-        if not is_amp:
-            self.model = self.model.to(dtype=dtype)
-            self.context = nullcontext()
-        else:
-            self.context = torch.amp.autocast("cuda", dtype=dtype)
+        # The encoder/decoder always run as a pure ``dtype`` (bf16 by default) forward
+        # pass: weights and inputs are cast to ``dtype`` and no autocast is used.
+        self.model = self.model.to(dtype=dtype)
 
     def count_param(self) -> int:
         return sum(p.numel() for p in self.model.parameters())
@@ -1188,10 +1233,8 @@ class WanVAE:
             Tensor of shape ``[B, z_dim, T//4, H//16, W//16]``.
         """
         in_dtype = videos.dtype
-        with self.context:
-            if not self.is_amp:
-                videos = videos.to(self.dtype)
-            latent = self.model.encode(videos, self.scale)
+        videos = videos.to(self.dtype)
+        latent = self.model.encode(videos, self.scale)
         latent = latent.to(in_dtype)
         return latent
 
@@ -1207,10 +1250,8 @@ class WanVAE:
             Tensor of shape ``[B, C, T, H, W]``.
         """
         in_dtype = zs.dtype
-        with self.context:
-            if not self.is_amp:
-                zs = zs.to(self.dtype)
-            video_recon = self.model.decode(zs, self.scale, clear_decoder_cache)
+        zs = zs.to(self.dtype)
+        video_recon = self.model.decode(zs, self.scale, clear_decoder_cache)
         video_recon = video_recon.to(in_dtype)
         return video_recon
 
@@ -1233,14 +1274,19 @@ class _ChunkEncodeForAOT(torch.nn.Module):
     (all ``None``) and ``cache_t>=1`` (some tensors, some ``None``).
     """
 
+    # ``register_buffer`` is opaque to type checkers, which then resolve these
+    # through ``nn.Module.__getattr__`` as ``Tensor | Module``; declare them.
+    scale_mean: torch.Tensor
+    scale_inv_std: torch.Tensor
+
     def __init__(
         self,
-        vae_model: torch.nn.Module,
+        vae_model: WanVAE_,
         scale_mean: torch.Tensor,
         scale_inv_std: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.vae = vae_model
+        self.vae: WanVAE_ = vae_model
         self.register_buffer("scale_mean", scale_mean.clone())
         self.register_buffer("scale_inv_std", scale_inv_std.clone())
 
@@ -1299,6 +1345,35 @@ def _collect_warmup_shapes(
     return all_shapes
 
 
+def _synchronized_reset_dir(path: str, *, is_distributed: bool, rank: int, mode: Literal["delete", "recreate"]) -> None:
+    """Delete (and optionally recreate) a directory in a distributed-safe way: barrier, rank-0 reset, barrier.
+
+    The leading barrier ensures every rank has finished using ``path`` before rank 0
+    removes it; the trailing barrier ensures no rank proceeds (e.g. recreates or writes
+    into ``path``) until the deletion has completed. ``ignore_errors=True`` guarantees the
+    delete never raises, so rank 0 always reaches the trailing barrier and cannot strand
+    the other ranks.
+
+    Args:
+        mode: ``"delete"`` removes ``path``; ``"recreate"`` removes ``path`` and then
+            recreates it as a fresh empty directory (before the trailing barrier), so every
+            rank observes the empty directory once the call returns.
+    """
+    import shutil
+
+    import torch.distributed as dist
+
+    if is_distributed:
+        dist.barrier()
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+        if mode == "recreate":
+            os.makedirs(path, exist_ok=True)
+        log.info(f"{'Reset' if mode == 'recreate' else 'Removed'} directory: {path}")
+    if is_distributed:
+        dist.barrier()
+
+
 class Wan2pt2VAEInterface(VideoTokenizerInterface):
     def __init__(
         self,
@@ -1340,24 +1415,28 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         # HuggingFace checkpoint has been updated to use a dictionary of chunk frames,
         # one for each resolution.
         if isinstance(encode_chunk_frames, int):
-            encode_chunk_frames = {"256": 68, "480": 24, "720": 12}
+            encode_chunk_frames = {"256": 68, "480": 24, "720": 8}
         assert isinstance(encode_chunk_frames, Mapping)
 
         assert all(c % 4 == 0 for c in encode_chunk_frames.values()), "encode_chunk_frames must be a multiple of 4"
 
         self.chunk_duration = chunk_duration
+        self.bucket_name = bucket_name
+        self.object_store_credential_path_pretrained = object_store_credential_path_pretrained
 
         # Local-path support: skip the s3:// prefix when bucket_name is empty
         # so OSS users can point vae_path at an absolute local file.
         vae_path_full = f"s3://{bucket_name}/{vae_path}" if bucket_name else vae_path
         self.model = WanVAE(
             dtype=torch.bfloat16,
-            is_amp=False,
             vae_pth=vae_path_full,
             object_store_credential_path_pretrained=object_store_credential_path_pretrained,
             temporal_window=encode_chunk_frames,
             encode_exact_durations=encode_exact_durations,
         )
+        # ``None`` selects Wan's native decoder. An installed replacement still
+        # shares this Wan VAE instance for encoding model input video.
+        self._decoder_override: nn.Module | None = None
         self.encode_chunk_frames = encode_chunk_frames
         self.encode_exact_durations = encode_exact_durations
 
@@ -1379,15 +1458,51 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
     def reset_dtype(self) -> None:
         pass
 
+    @property
+    def active_decoder(self) -> nn.Module:
+        """Return the decoder selected for model latents.
+
+        The default is the inner Wan decoder. ``set_decoder`` replaces only
+        this decode half; the Wan encoder remains available through ``encode``.
+        """
+        decoder_override = getattr(self, "_decoder_override", None)
+        if decoder_override is not None:
+            return decoder_override
+        return self.model.model
+
+    def get_output_range(self) -> str:
+        """Return the active decoder's pixel-output range contract."""
+        return self.active_decoder.get_output_range()
+
+    def set_decoder(self, decoder: nn.Module) -> None:
+        """Install a model-latent decoder while retaining the Wan encoder."""
+        if self._keep_decoder_cache:
+            raise RuntimeError("Cannot replace the decoder while a cached decode scope is active.")
+        clear_decoder_cache = getattr(decoder, "clear_decoder_cache", None)
+        if not callable(clear_decoder_cache):
+            raise ValueError("A Wan decoder override must provide clear_decoder_cache().")
+        get_output_range = getattr(decoder, "get_output_range", None)
+        output_range = get_output_range() if callable(get_output_range) else None
+        if output_range not in {"[-1,1]", "[0,1]"}:
+            raise ValueError("Decoder override must provide get_output_range() returning '[-1,1]' or '[0,1]'.")
+        self._decoder_override = decoder
+        clear_decoder_cache()
+
     @contextmanager
     def use_cached_decoder(self) -> Generator[None, None, None]:
-        """Enable decoder-cache reuse for sequential decode calls."""
-        self.model.model.clear_decoder_cache()
+        """Enable decoder-cache reuse for sequential decode calls.
+
+        A cached scope represents one generation and keeps one decoder active
+        for its complete cache lifecycle. ``set_decoder`` rejects replacements
+        until the scope exits.
+        """
+        decoder = self.active_decoder
+        decoder.clear_decoder_cache()
         self._keep_decoder_cache = True
         try:
             yield
         finally:
-            self.model.model.clear_decoder_cache()
+            decoder.clear_decoder_cache()
             self._keep_decoder_cache = False
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
@@ -1410,10 +1525,13 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         Returns:
             Tensor of shape ``[B, C, T, H, W]``.
         """
-        return self.model.decode(
-            latent,
-            clear_decoder_cache=not self._keep_decoder_cache,
-        )  # [B,3,T,H,W]
+        decoder_override = getattr(self, "_decoder_override", None)
+        if decoder_override is not None:
+            return decoder_override(
+                latent,
+                clear_decoder_cache=not self._keep_decoder_cache,
+            )  # [B,3,T,H,W]
+        return self.model.decode(latent, clear_decoder_cache=not self._keep_decoder_cache)  # [B,3,T,H,W]
 
     @torch.no_grad()
     def compile_encode(
@@ -1447,6 +1565,18 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         Compiled functions are installed as ``self.model.model._aot_chunk_fns``
         for dispatch by ``_run_chunk`` inside ``WanVAE_.encode``.
 
+        **Benchmarking** — after a variant is loaded and passes the correctness gate, it is
+        also timed via CUDA events (a handful of warmup calls, then a handful of measured
+        calls, keeping the median), using the exact same probe input/cache and the exact
+        same compiled function ``_run_chunk`` would dispatch to at training time -- so the
+        measured time is the real per-chunk cost, not a proxy for it. Since every rank
+        already loads and validates the FULL gathered set of variants (not just the ones it
+        personally compiled), every rank measures the same set of keys; the per-key MAX
+        across ranks is kept as the canonical table (mirrors ``cost_model.benchmark``'s own
+        MAX-across-ranks convention for step time: the slowest rank's number is the one a
+        load-balancing decision has to respect). The result is installed as
+        ``self.model.model._aot_chunk_times`` and consumed by :meth:`predicted_encode_seconds`.
+
         Args:
             warmup_resolutions: Resolution keys (e.g. ``["256", "480", "720"]``).
             output_dir: Root directory under which compiled ``.pt2`` packages
@@ -1456,9 +1586,6 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             aspect_ratio: If given, only compile this single aspect ratio per
                 resolution instead of all available ratios.
         """
-        import torch._inductor
-        import torch.distributed as dist
-
         log.info(f"AOT chunk-level warmup for resolutions: {warmup_resolutions}", rank0_only=False)
         start_time = time.time()
 
@@ -1475,11 +1602,15 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         scale = wanvae.scale  # (mean, 1/std)
         n_cache_slots = wanvae_model._enc_conv_num
 
+        # Clear any packages left behind by a previous (possibly failed/interrupted) run and
+        # recreate a fresh directory, so every call starts clean and every variant is rebuilt:
+        # a package built for a different model, tokenizer config, or torch/AOTInductor
+        # version can fail on load or dispatch, or -- if it happens to match this run's
+        # export shape while differing underneath -- pass the correctness gate below by
+        # chance for its probed shape and still miscompile at another.
+        _synchronized_reset_dir(save_dir, is_distributed=is_distributed, rank=rank, mode="recreate")
         if rank == 0:
             log.info(f"Saving AOT compiled packages to {save_dir}")
-            os.makedirs(save_dir, exist_ok=True)
-        if is_distributed:
-            dist.barrier()
 
         # -- Helper functions --------------------------------------------------
 
@@ -1498,10 +1629,6 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             t_chunk, H_patch, W_patch, cache_t = aot_key
             pkg_name = f"chunk_ct{cache_t}_{t_chunk}f_{H_patch}x{W_patch}.pt2"
             pkg_path = os.path.join(save_dir, pkg_name)
-
-            if os.path.exists(pkg_path):
-                log.info(f"Rank {rank}: reusing cached {pkg_name}", rank0_only=False)
-                return pkg_path
 
             t0 = time.time()
             try:
@@ -1527,6 +1654,34 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
                     rank0_only=False,
                 )
                 return None
+
+        def _time_variant(fn: Callable, key: _AOTChunkKey, warmup: int = 3, iters: int = 8) -> float:
+            """Median per-call seconds for one loaded AOT chunk function, via CUDA events.
+
+            Same non-synchronizing-``record``/deferred-readout idiom as ``MethodTimer``
+            (``utils/method_timer.py``), applied per chunk call instead of per whole
+            ``encode()`` call. Requires the caller to synchronize before reading elapsed
+            time, which the final ``torch.cuda.synchronize()`` below provides.
+            """
+            t_chunk, H_patch, W_patch, cache_t = key
+            x_probe = _rand_input(t_chunk, H_patch, W_patch).contiguous()
+            probe_cache = [
+                c.contiguous() if c is not None else None for c in probe_cache_map[(H_patch, W_patch)][cache_t]
+            ]
+            for _ in range(warmup):
+                fn(x_probe, list(probe_cache))
+            torch.cuda.synchronize()
+            events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+            for _ in range(iters):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                fn(x_probe, list(probe_cache))
+                end.record()
+                events.append((start, end))
+            torch.cuda.synchronize()
+            samples = sorted(start.elapsed_time(end) / 1000.0 for start, end in events)
+            return samples[len(samples) // 2]
 
         # -- Enumerate all variant keys and distribute across ranks ------------
 
@@ -1562,16 +1717,31 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             rank0_only=False,
         )
 
-        # -- Build reference caches lazily, only for this rank's shapes --------
+        # -- Build probe caches up front (shared by compile + validation) ------
+        # A "probe cache" is a valid eager ``feat_cache`` with a given temporal
+        # extent (``cache_t``). It is needed in two places: (1) as the example
+        # ``feat_cache`` fed to ``torch.export`` when compiling a variant, and
+        # (2) as the eager reference cache for the post-load correctness gate.
+        # Every rank validates every gathered variant, so probe caches for *all*
+        # warmup shapes are needed on every rank regardless of which shapes this
+        # rank compiled. We therefore build them all once here: a single source of
+        # truth for the eager cache layout, and no redundant second eager pass like
+        # the old ``_build_probe_cache`` did.
+        #
+        # The cache shape depends only on ``(H_patch, W_patch, cache_t)`` and never
+        # on the chunk length used to produce it, so we key on the spatial dims and
+        # always build with the cheap 1-/2-frame inputs.
 
         wrapper = _ChunkEncodeForAOT(wanvae_model, scale[0], scale[1])
         wrapper.eval()
 
-        def _get_ref_caches(
-            chunk_frames: int,
-            H_patch: int,
-            W_patch: int,
-        ) -> dict[int, list[torch.Tensor | None]]:
+        def _build_probe_caches(H_patch: int, W_patch: int) -> dict[int, list[torch.Tensor | None]]:
+            """Return the ``{cache_t: feat_cache}`` map for one spatial shape.
+
+            ``cache_t=0`` is the all-``None`` prime, ``cache_t=1`` is the post-prime
+            cache (after a 1-frame chunk), and ``cache_t=2`` is the steady-state
+            cache (after a 2-frame chunk).
+            """
             cache_ct0: list[torch.Tensor | None] = [None] * n_cache_slots
             _, cache_ct1 = wanvae_model._encode_chunk_impl(
                 _rand_input(1, H_patch, W_patch),
@@ -1579,20 +1749,24 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
                 scale,
             )
             _, cache_ct2 = wanvae_model._encode_chunk_impl(
-                _rand_input(chunk_frames, H_patch, W_patch),
+                _rand_input(2, H_patch, W_patch),
                 list(cache_ct1),
                 scale,
             )
             return {0: cache_ct0, 1: cache_ct1, 2: cache_ct2}
 
-        ref_cache_map: dict[_ShapeInfo, dict[int, list[torch.Tensor | None]]] = {}
+        # Deduplicate to unique spatial shapes (a resolution's chunk_frames doesn't
+        # affect the cache shape), preserving first-seen order for deterministic builds.
+        unique_spatial_shapes = dict.fromkeys((H_patch, W_patch) for _chunk_frames, H_patch, W_patch in all_shapes)
+        probe_cache_map: dict[tuple[int, int], dict[int, list[torch.Tensor | None]]] = {
+            spatial_key: _build_probe_caches(*spatial_key) for spatial_key in unique_spatial_shapes
+        }
 
         my_pkg_paths: dict[_AOTChunkKey, str] = {}
         for aot_key, shape_info in my_variant_keys:
+            _chunk_frames, H_patch, W_patch = shape_info
             cache_t = aot_key[3]
-            if shape_info not in ref_cache_map:
-                ref_cache_map[shape_info] = _get_ref_caches(*shape_info)
-            ref_cache = ref_cache_map[shape_info][cache_t]
+            ref_cache = probe_cache_map[(H_patch, W_patch)][cache_t]
             pkg_path = _compile_variant(wrapper, aot_key, ref_cache)
             if pkg_path is not None:
                 my_pkg_paths[aot_key] = pkg_path
@@ -1613,7 +1787,78 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         device_index = torch.cuda.current_device()
         state_dict = wrapper.state_dict()
 
+        def _variant_matches_eager(fn: Callable, key: _AOTChunkKey) -> bool:
+            """Return whether a compiled variant reproduces eager _encode_chunk_impl.
+
+            Some torch/AOTInductor versions silently miscompile specific shapes. This must
+            check BOTH the latent output AND the returned feat_cache, because the two failure
+            modes observed on the 12-frame 360x640 chunk differ by version:
+              - torch 2.12 corrupts the latent outright (~80% of elements wrong).
+              - torch 2.9 produces a correct latent but a wrong returned cache slot, which
+                silently corrupts the *next* chunk once it is threaded back in.
+            A latent-only check would keep the 2.9-miscompiled variant and still corrupt
+            downstream chunks. Layout is normalized with ``.contiguous()`` exactly as
+            ``_run_chunk`` does at dispatch time.
+            """
+            t_chunk, H_patch, W_patch, cache_t = key
+            x_probe = _rand_input(t_chunk, H_patch, W_patch).contiguous()
+            # Reuse the probe cache built up front. The comprehension copies the list
+            # and re-canonicalizes layout so the ``.contiguous()`` normalization never
+            # mutates the shared entry.
+            probe_cache = [
+                c.contiguous() if c is not None else None for c in probe_cache_map[(H_patch, W_patch)][cache_t]
+            ]
+
+            eager_out, eager_cache = wanvae_model._encode_chunk_impl(x_probe, list(probe_cache), scale)
+            aot_out, aot_cache = fn(x_probe, list(probe_cache))
+
+            # (name, aot_tensor, eager_tensor) for the latent and every non-None cache slot.
+            to_check: list[tuple[str, torch.Tensor | None, torch.Tensor | None]] = [("latent", aot_out, eager_out)]
+            if len(aot_cache) != len(eager_cache):
+                log.warning(
+                    f"Rank {rank}: AOT variant {key} returned {len(aot_cache)} cache slots, "
+                    f"eager returned {len(eager_cache)}; falling back to eager for this shape.",
+                    rank0_only=False,
+                )
+                return False
+            for i, (aot_c, eager_c) in enumerate(zip(aot_cache, eager_cache)):
+                if eager_c is None and aot_c is None:
+                    continue
+                to_check.append((f"cache[{i}]", aot_c, eager_c))
+
+            for name, aot_t, eager_t in to_check:
+                if (
+                    aot_t is None
+                    or eager_t is None
+                    or not torch.allclose(aot_t.float(), eager_t.float(), rtol=1e-3, atol=0.2)
+                ):
+                    if aot_t is not None and eager_t is not None:
+                        abs_diff = (aot_t.float() - eager_t.float()).abs()
+                        max_abs = abs_diff.max().item()
+                        # Per-element relative difference (|aot - eager| / |eager|), then the
+                        # max over elements. Guard against div-by-zero on zero-valued eager
+                        # elements; those elements are only compared via the abs term.
+                        eager_abs = eager_t.float().abs()
+                        rel_diff = torch.where(
+                            eager_abs > 0,
+                            abs_diff / eager_abs.clamp_min(1e-12),
+                            torch.zeros_like(abs_diff),
+                        )
+                        max_rel = rel_diff.max().item()
+                    else:
+                        max_abs = float("nan")
+                        max_rel = float("nan")
+                    log.warning(
+                        f"Rank {rank}: AOT variant {key} failed correctness check on {name} "
+                        f"(max_abs_diff={max_abs:.3f}, max_rel_diff={max_rel:.3f}); "
+                        f"falling back to eager for this shape.",
+                        rank0_only=False,
+                    )
+                    return False
+            return True
+
         loaded_fns: dict[_AOTChunkKey, Callable] = {}
+        my_chunk_times: dict[_AOTChunkKey, float] = {}
         for key, pkg_path in pkg_paths.items():
             try:
                 fn = torch._inductor.aoti_load_package(pkg_path, device_index=device_index)
@@ -1622,7 +1867,11 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
                 constants_map = {k: v for k, v in state_dict.items() if k in required_keys}
                 fn.load_constants(constants_map, check_full_update=True, user_managed=True)
 
-                loaded_fns[key] = fn
+                # Correctness gate: drop miscompiled variants so encode() falls back to eager
+                # for those shapes rather than silently emitting garbage latents.
+                if _variant_matches_eager(fn, key):
+                    loaded_fns[key] = fn
+                    my_chunk_times[key] = _time_variant(fn, key)
             except Exception as e:
                 log.warning(
                     f"Rank {rank}: failed to load {pkg_path}: {e}",
@@ -1631,27 +1880,164 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
 
         wanvae_model._aot_chunk_fns = loaded_fns
 
+        # -- Enable predicted-time benchmarking only as one coordinated group decision. ---
+        # Per-rank load/correctness failures (see ``_variant_matches_eager`` above) can leave
+        # ``loaded_fns`` short of ``pkg_paths`` differently on different ranks, while
+        # ``_aot_chunk_fns`` (this rank's own usable set, used by the real encode path) stays
+        # rank-local regardless. Reconciling that per key is unnecessary complexity: instead,
+        # every rank checks the same all-or-nothing condition -- did THIS rank load and
+        # validate every variant in the (already all-gathered, so identical everywhere)
+        # ``pkg_paths`` -- then one cheap boolean all-gather (instead of reconciling per key)
+        # is enough for every rank to agree whether ANY rank came up short, so the group
+        # either keeps predicted times for every variant or none. Compiled chunks still run
+        # AOT wherever loaded, even when the group ends up disabling load-balancing predictions.
+        rank_complete = len(loaded_fns) == len(pkg_paths)
+        if is_distributed:
+            gathered_complete: list[bool] = [False] * world_size
+            dist.all_gather_object(gathered_complete, rank_complete)
+            all_complete = all(gathered_complete)
+        else:
+            all_complete = rank_complete
+
+        if not all_complete:
+            log.warning(
+                f"Rank {rank}: not every rank loaded and validated every AOT chunk variant "
+                f"({len(loaded_fns)}/{len(pkg_paths)} on this rank); disabling VAE load-balancing "
+                "predictions for this tokenizer (compiled chunks still run AOT where available).",
+                rank0_only=False,
+            )
+            chunk_times: dict[_AOTChunkKey, float] = {}
+        elif is_distributed:
+            gathered_times: list[dict[_AOTChunkKey, float]] = [{}] * world_size
+            dist.all_gather_object(gathered_times, my_chunk_times)
+            chunk_times = {}
+            for rank_times in gathered_times:
+                for key, seconds in rank_times.items():
+                    chunk_times[key] = max(chunk_times.get(key, 0.0), seconds)
+        else:
+            chunk_times = my_chunk_times
+        if is_distributed:
+            dist.barrier()
+        wanvae_model._aot_chunk_times = chunk_times
+
+        # Release the memoized probe/reference caches now that both compilation and
+        # validation are done; the loaded functions hold the model weights separately.
+        probe_cache_map.clear()
+
         log.info(
             f"Rank {rank}: AOT compiled {len(my_pkg_paths)}, "
             f"loaded {len(loaded_fns)}/{len(all_variant_keys)} chunk variants, "
+            f"timed {len(chunk_times)}/{len(all_variant_keys)}, "
             f"time: {time.time() - start_time:.2f}s",
             rank0_only=False,
         )
 
         # Clean up .pt2 files so stale packages don't persist across restarts.
-        if is_distributed:
-            dist.barrier()
-        if rank == 0:
-            import shutil
-
-            try:
-                shutil.rmtree(save_dir)
-                log.info(f"Cleaned up AOT cache dir: {save_dir}")
-            except OSError as e:
-                log.warning(f"Failed to clean AOT cache dir {save_dir}: {e}")
+        _synchronized_reset_dir(save_dir, is_distributed=is_distributed, rank=rank, mode="delete")
 
         if not loaded_fns:
             raise RuntimeError("AOT compilation produced no loadable functions")
+
+    @property
+    def encode_seconds_benchmarked(self) -> bool:
+        """Whether :meth:`predicted_encode_seconds` can be called without raising.
+
+        ``compile_encode`` (see the ``CompileTokenizer`` callback) typically runs a few
+        steps into training, not at step 0, so a caller that wants to use
+        ``predicted_encode_seconds`` from the very first step (e.g. VAE load balancing in
+        ``OmniMoTModel._offloaded_vae_encode``) needs a way to tell "not benchmarked yet"
+        from "benchmarked, but this specific shape is missing" -- the latter still raises,
+        deliberately, since silently guessing defeats the point of an exact predictor.
+        """
+        wanvae_model = self.model.model
+        return bool(getattr(wanvae_model, "_aot_chunk_times", None))
+
+    def predicted_encode_seconds(self, num_pixel_frames: int, height: int, width: int) -> float:
+        """Exact predicted VAE-encode time for one sample, from :meth:`compile_encode`'s benchmark.
+
+        Mirrors ``WanVAE_.encode``'s own chunk decomposition exactly (same padding decision,
+        same remainder handling), then sums the benchmarked cost of the chunks a real
+        ``encode()`` call on this shape would actually run: the 1-frame prime chunk
+        (``cache_t=0``), the first post-prime full-size chunk (``cache_t=1``) if there is one,
+        every subsequent full-size steady-state chunk (``cache_t=2``), and a final remainder
+        chunk if the clip doesn't divide evenly and wasn't padded. This is a sum of MEASURED
+        per-chunk times (see :meth:`compile_encode`), not a fitted model -- there is no
+        residual error to speak of, only whatever noise the underlying CUDA-event
+        measurements carried.
+
+        Args:
+            num_pixel_frames: Pixel-space frame count (``1`` for an image).
+            height: Padded pixel canvas height (before the 2x2-patchify this VAE applies
+                internally -- the same ``height`` :class:`SampleSpec.pixel_shape` reports).
+            width: Padded pixel canvas width, same convention as ``height``.
+
+        Returns:
+            Predicted wall-clock seconds for one ``encode()`` call on this shape.
+
+        Raises:
+            RuntimeError: If :meth:`compile_encode` was never called (no benchmarked table),
+                or if this shape needs a chunk variant that was not compiled/benchmarked --
+                deliberately not a silent fallback, since the whole point of this method is
+                to be exact rather than to guess.
+        """
+        wanvae_model = self.model.model
+        chunk_times: dict[_AOTChunkKey, float] | None = getattr(wanvae_model, "_aot_chunk_times", None)
+        if not chunk_times:
+            raise RuntimeError(
+                "predicted_encode_seconds requires compile_encode() to have been called first "
+                "(no benchmarked _aot_chunk_times table is installed)."
+            )
+
+        if isinstance(wanvae_model.temporal_window, Mapping):
+            resolution = get_vision_data_resolution((height, width))
+            temporal_window = wanvae_model.temporal_window[resolution]
+        else:
+            temporal_window = wanvae_model.temporal_window
+
+        assert num_pixel_frames == 1 or (num_pixel_frames - 1) % 4 == 0, (
+            f"num_pixel_frames must be 1 or 4n+1, got {num_pixel_frames}"
+        )
+        assert height % 2 == 0 and width % 2 == 0, f"height/width must be even for patchify, got {height}x{width}"
+        H_patch, W_patch = height // 2, width // 2
+
+        def lookup(key: _AOTChunkKey) -> float:
+            seconds = chunk_times.get(key)
+            if seconds is None:
+                raise RuntimeError(
+                    f"No benchmarked time for AOT chunk shape {key} -- this shape's resolution was not "
+                    "in compile_encode()'s warmup_resolutions, or that variant failed the correctness gate."
+                )
+            return seconds
+
+        total = lookup((1, H_patch, W_patch, 0))  # prime chunk, always present
+
+        T = num_pixel_frames
+
+        # How many full-size post-prime chunks, and what's left over. Same split
+        # WanVAE_.encode's own chunk loop produces once padding (below) is accounted for.
+        n_full, remainder = divmod(T - 1, temporal_window)
+
+        # Same should_pad decision WanVAE_.encode makes: every length pads to a full
+        # temporal_window boundary except a duration pinned via encode_exact_durations,
+        # which runs unpadded at its true (possibly remainder-sized) length -- see
+        # WanVAE_.encode's docstring. Padding rounds the partial chunk up to a full one,
+        # so there are only two shapes to ever look up below: a full-size chunk (padded
+        # case), or the exact remainder (pinned-duration case).
+        if remainder > 0 and T not in (wanvae_model._encode_exact_durations or set()):
+            n_full += 1
+            remainder = 0
+
+        if n_full >= 1:
+            total += lookup((temporal_window, H_patch, W_patch, 1))
+            if n_full >= 2:
+                total += (n_full - 1) * lookup((temporal_window, H_patch, W_patch, 2))
+            if remainder > 0:
+                total += lookup((remainder, H_patch, W_patch, 2))
+        elif remainder > 0:
+            # The lone remainder chunk follows the prime directly -- post-prime cache_t=1.
+            total += lookup((remainder, H_patch, W_patch, 1))
+
+        return total
 
     def get_latent_num_frames(self, num_pixel_frames: int) -> int:
         return 1 + (num_pixel_frames - 1) // 4

@@ -46,40 +46,13 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import TensorType, logging
 from transformers.video_utils import VideoInput, group_videos_by_shape, reorder_videos
 
+from cosmos_framework.utils.cosmos3_edge_artifacts import is_cosmos3_edge_native_snapshot  # noqa: F401
+
 logger = logging.get_logger(__name__)
 
 # Sub-processor config keys that name (remote-code or transformers-main) classes.
 # Only the parameter VALUES are consumed; the framework picks the classes itself.
 _CLASS_NAME_KEYS = ("processor_class", "image_processor_type", "video_processor_type", "auto_map")
-
-
-def is_cosmos3_edge_native_snapshot(model_dir: str) -> bool:
-    """Return True for a renewed (native-metadata, no remote code) Cosmos3-Edge snapshot.
-
-    Detection rule: ``config.json`` says ``model_type == "cosmos3_edge"``, or a
-    ``processor_config.json`` names the native ``Cosmos3EdgeProcessor``. Old
-    snapshots (``model_type == "nemotron_siglip2"``, remote-code ``processing.py``)
-    and all other models match neither and keep the ``AutoProcessor`` path.
-    """
-    if not os.path.isdir(model_dir):
-        return False
-    config_path = os.path.join(model_dir, "config.json")
-    if os.path.isfile(config_path):
-        try:
-            with open(config_path) as f:
-                if json.load(f).get("model_type") == "cosmos3_edge":
-                    return True
-        except (OSError, ValueError):
-            pass
-    processor_config_path = os.path.join(model_dir, "processor_config.json")
-    if os.path.isfile(processor_config_path):
-        try:
-            with open(processor_config_path) as f:
-                if json.load(f).get("processor_class") == "Cosmos3EdgeProcessor":
-                    return True
-        except (OSError, ValueError):
-            pass
-    return False
 
 
 def build_cosmos3_edge_processor(model_dir: str) -> "NemotronNanoV3BridgeProcessor":

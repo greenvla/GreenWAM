@@ -22,6 +22,13 @@ class TextTokenizerTransform(Augmentor):
         tokenizer_config = self.args["tokenizer_config"]
         self.cfg_dropout_rate = self.args["cfg_dropout_rate"]
         self.use_system_prompt = self.args.get("use_system_prompt", False)
+        self.max_text_tokens = self.args.get("max_text_tokens", _MAX_NUM_TOKENS)
+        if (isinstance(self.max_text_tokens, bool) or not isinstance(self.max_text_tokens, int)
+                or not 1 <= self.max_text_tokens <= _MAX_NUM_TOKENS):
+            raise ValueError(f"max_text_tokens must be an integer in [1, {_MAX_NUM_TOKENS}]")
+        self.overflow_policy = self.args.get("overflow_policy", "truncate")
+        if self.overflow_policy not in {"truncate", "error"}:
+            raise ValueError("overflow_policy must be truncate or error")
 
         self._processor = lazy_instantiate(tokenizer_config)
 
@@ -33,30 +40,47 @@ class TextTokenizerTransform(Augmentor):
             input_caption = json.dumps(input_caption)
             data_dict[self.input_keys[0]] = input_caption
 
+        text_ids = None
+        if self.overflow_policy == "error":
+            # Check the fully rendered prompt and chat template before CFG;
+            # random dropout must not conceal an invalid training example.
+            text_ids = self._processor.tokenize_text(
+                input_caption, is_video=False, use_system_prompt=self.use_system_prompt)
+            if len(text_ids) > self.max_text_tokens:
+                raise ValueError(
+                    f"Prompt atom={data_dict.get('atom_id', 'unknown')} mode={data_dict.get('greenwam_mode', 'unknown')}: "
+                    f"final rendered prompt has {len(text_ids)} tokens, limit={self.max_text_tokens}; "
+                    "shorten the source prompt or change max_text_tokens; no tokens were truncated")
+            if "greenwam_prompt" in data_dict:
+                data_dict["greenwam_prompt"].update(rendered_token_count=len(text_ids), max_text_tokens=self.max_text_tokens)
+
         if self.cfg_dropout_rate > 0:
             # If CFG is used, randomly dropout the input caption
             # We dropout the input caption by replacing it with an empty string
             if random.random() < self.cfg_dropout_rate:
                 input_caption = ""
                 data_dict[self.input_keys[0]] = input_caption
+                text_ids = None
 
-        text_ids = self._processor.tokenize_text(
-            input_caption,
-            is_video=False,
-            use_system_prompt=self.use_system_prompt,
-        )
-        text_ids = text_ids[:_MAX_NUM_TOKENS]  # truncate the text ids to the maximum number of tokens
-        # This will take care of wierd edge cases where we generate extremely long captions
+        if text_ids is None:
+            text_ids = self._processor.tokenize_text(
+                input_caption, is_video=False, use_system_prompt=self.use_system_prompt)
+        if self.overflow_policy == "truncate":
+            text_ids = text_ids[:self.max_text_tokens]
+        elif len(text_ids) > self.max_text_tokens:
+            raise ValueError(f"Empty CFG prompt exceeds max_text_tokens={self.max_text_tokens}")
         data_dict[self.output_keys[0]] = torch.tensor(text_ids)  # [N_tokens]
         return data_dict
 
 
 _SYSTEM_PROMPT_IMAGE_EDITING = "You are a helpful assistant who will edit images based on the user's instructions."
+_SYSTEM_PROMPT_VIDEO_EDITING = "You are a helpful assistant who will edit videos based on the user's instructions."
 
 _SYSTEM_PROMPT_TRANSFER = "You are a helpful assistant that generates images or videos following the user's instructions and control signals (edge maps, blur, depth, or segmentation)."
 
 _SYSTEM_PROMPTS = {
     "editing": _SYSTEM_PROMPT_IMAGE_EDITING,
+    "video_editing": _SYSTEM_PROMPT_VIDEO_EDITING,
     "transfer": _SYSTEM_PROMPT_TRANSFER,
 }
 
