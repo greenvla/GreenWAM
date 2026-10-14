@@ -1,0 +1,255 @@
+{
+ "schema_name": "layout_extensions",
+ "schema_version": 1,
+ "parent_shared_projectors_sha256": "73bd56ed84782b7851133b12ee667873e45b47950b75a91c69926d2b11d64655",
+ "layouts": [
+  {
+   "layout_id": "robotwin2__aloha_agilex__14__14",
+   "cluster_id": "C20",
+   "cluster_key": "DualArmB_ARX5_common14_bodyparts_v2",
+   "sources": [
+    "RoboTwin2"
+   ],
+   "roots": 1,
+   "atoms": 4203,
+   "recipe": {
+    "source_columns": [
+     "observation.state"
+    ],
+    "raw_state_width": 14,
+    "source_indices": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     12,
+     13
+    ],
+    "canonical_names": [
+     "manipulator_1_joint_0_position",
+     "manipulator_1_joint_1_position",
+     "manipulator_1_joint_2_position",
+     "manipulator_1_joint_3_position",
+     "manipulator_1_joint_4_position",
+     "manipulator_1_joint_5_position",
+     "gripper_1_position",
+     "manipulator_2_joint_0_position",
+     "manipulator_2_joint_1_position",
+     "manipulator_2_joint_2_position",
+     "manipulator_2_joint_3_position",
+     "manipulator_2_joint_4_position",
+     "manipulator_2_joint_5_position",
+     "gripper_2_position"
+    ],
+    "destination_slots": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     12,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     13
+    ],
+    "target_dim": 14,
+    "availability_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1
+    ],
+    "scale": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0
+    ],
+    "offset": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "target_form": "absolute inverse; explicit block-anchor delta slots for forward/forward_ar/wam; remaining slots absolute",
+    "native_action_used": false,
+    "adapter_readiness": "source_adapter_available_calibration_unverified",
+    "runtime_semantic_gather_available": true,
+    "source_adapter_conditions": {
+     "arm": null,
+     "gripper": null,
+     "pending_semantic_map": null,
+     "requirements": [
+      "RoboTwin joint_action/vector is the recorded command; L6, Lg, R6, Rg order (left = manipulator_1).",
+      "X5 joint coordinates as recorded (FK check); grippers 0..1 with 1 = open, as dual-arm B."
+     ]
+    },
+    "validity_contract": {
+     "availability_mask_is_static": true,
+     "per_frame_loss_mask": "static availability AND finite selected future value AND valid timestamp pair within same episode/admitted interval AND applicable source_adapter_conditions; reject invalid channels, never clip to declared endpoint",
+     "clip": false
+    },
+    "runtime_calibration_fully_validated": false,
+    "source_local_fallback": null,
+    "temporal": "explicit delta in seconds within same admitted interval and episode; no terminal repetition",
+    "dropped_groups": [],
+    "source_column_shapes": {
+     "observation.state": [
+      14
+     ]
+    },
+    "delta_target_slots": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11
+    ],
+    "contract_version": 2,
+    "source_coordinate_ledger": [
+     {
+      "source_index": 0,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 1,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 2,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 3,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 4,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 5,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 6,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 7,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 8,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 9,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 10,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 11,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 12,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     },
+     {
+      "source_index": 13,
+      "status": "mapped",
+      "reason": "explicit source gather"
+     }
+    ],
+    "sign_corrections": [],
+    "rule_sign_corrections": [],
+    "gripper_codec_corrections": [
+     {
+      "source_index": 6,
+      "target_slot": 12,
+      "role": "hands.left.gripper",
+      "scale": 1.0,
+      "offset": 0.0,
+      "evidence": "RoboTwin 2.0 open/close_gripper(pos): 1 = open, 0 = closed (envs/_base_task.py); same 0..1, 1 = open convention as dual-arm B gripper_k_position"
+     },
+     {
+      "source_index": 13,
+      "target_slot": 13,
+      "role": "hands.right.gripper",
+      "scale": 1.0,
+      "offset": 0.0,
+      "evidence": "RoboTwin 2.0 open/close_gripper(pos): 1 = open, 0 = closed (envs/_base_task.py); same 0..1, 1 = open convention as dual-arm B gripper_k_position"
+     }
+    ]
+   },
+   "semantic_layout_id": 42
+  }
+ ]
+}

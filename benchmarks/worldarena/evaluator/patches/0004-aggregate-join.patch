@@ -1,0 +1,86 @@
+# Joins per-frame and VLM results on one canonical video id, names the photometric column Photometric Consistency,
+# prefers the merged VLM summary and writes the JEPA column as JEPA Similarity, so the CSV holds all 15 metrics.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/csv_results/aggregate_results.py b/video_quality_ood/csv_results/aggregate_results.py
+index 32d1547..d08525d 100644
+--- a/video_quality_ood/csv_results/aggregate_results.py
++++ b/video_quality_ood/csv_results/aggregate_results.py
+@@ -2,8 +2,12 @@ import csv
+ import glob
+ import json
+ import os
++import re
+ from typing import Dict, List, Optional
+ 
++# {task}_episode_1 / {task}_episode1 / {task}_episode.1 -> {task}_episode1
++_EPISODE_TAIL = re.compile(r"^(?P<task>.+)_episode[._]?(?P<num>\d+)$", re.IGNORECASE)
++
+ # Column order for the final CSV
+ COLUMN_ORDER: List[str] = [
+     "Model_Name",
+@@ -42,6 +46,7 @@ METRIC_KEY_MAP: Dict[str, str] = {
+     "depth_accuracy": "Depth Accuracy",
+     "trajectory_accuracy": "Trajectory Accuracy",
+     "photometric_consistency": "Photometric Consistency",
++    "photometric_smoothness": "Photometric Consistency",
+     "motion_smoothness": "Motion Smoothness",
+     "jepa_similarity": "JEPA Similarity",
+ }
+@@ -52,6 +57,19 @@ def _read_json(path: str):
+         return json.load(f)
+ 
+ 
++def _canonical_video_id(name: str) -> str:
++    """Unify Video_ID so jpeg-path and VLM stem join.
++
++    jpeg:  .../fixed_scene_task/episode1/1/video -> fixed_scene_task_episode1
++    VLM:   fixed_scene_task_episode_1.mp4        -> fixed_scene_task_episode1
++    """
++    name = (name or "").strip()
++    m = _EPISODE_TAIL.match(name)
++    if m:
++        return f"{m.group('task')}_episode{m.group('num')}"
++    return name
++
++
+ def _parse_video_id_from_path(path: str) -> str:
+     # Normalize separators and strip extension when present
+     norm = path.replace("\\", "/")
+@@ -86,12 +104,10 @@ def _parse_video_id_from_path(path: str) -> str:
+                     video_id = f"{task}_episode{suffix}"
+                 else:
+                     video_id = f"{task}_{episode}"
+-                return video_id
+-    # If path already encodes id (e.g., adjust_bottle_episode40.mp4)
++                return _canonical_video_id(video_id)
+     if name and any(char.isdigit() for char in name):
+-        return name
+-    # Fallback to base name
+-    return name or norm
++        return _canonical_video_id(name)
++    return _canonical_video_id(name or norm)
+ 
+ 
+ def _upsert(result: Dict[str, Dict[str, float]], video_id: str, metric_key: str, value: Optional[float]):
+@@ -188,7 +204,9 @@ def aggregate_results(
+     # VLM metrics
+     vlm_dir = os.path.join(base_dir, "output_VLM", vlm_model_dir or model_name)
+     if os.path.isdir(vlm_dir):
+-        for json_path in glob.glob(os.path.join(vlm_dir, "*.json")):
++        merged = sorted(glob.glob(os.path.join(vlm_dir, "*_summary_val_all_intern.json")))
++        vlm_files = merged if merged else sorted(glob.glob(os.path.join(vlm_dir, "*.json")))
++        for json_path in vlm_files:
+             _ingest_vlm_json(json_path, result)
+ 
+     # JEPA score (global, applied to every row)
+@@ -216,7 +234,7 @@ def aggregate_results(
+             if metric_col in COLUMN_ORDER:
+                 row[metric_col] = value
+         if jepa_score is not None:
+-            row["JEPA_Similarity"] = jepa_score
++            row["JEPA Similarity"] = jepa_score
+         csv_rows.append(row)
+ 
+     # Ensure output directory exists

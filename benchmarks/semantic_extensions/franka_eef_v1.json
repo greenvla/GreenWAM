@@ -1,0 +1,137 @@
+{
+ "schema_name": "greenwam_semantic_extensions",
+ "schema_version": 1,
+ "parent_semantic_space_sha256": "68c811c9ae2769826d123f6b416470c685d5de262f2d2d854eaadaad972b8394",
+ "description": "Single-arm Franka end effector (CALVIN, LIBERO): right-arm EEF xyz + rotation-6d and the right gripper on transport 0..9; framewise relative EEF targets (contract 76), absolute q0 prefix (contract 90); a new layout and context row 44.",
+ "contracts": {
+  "76": {
+   "family_id": "franka_eef",
+   "representation": "eef_relative"
+  },
+  "90": {
+   "family_id": "franka_eef",
+   "representation": "eef_absolute"
+  }
+ },
+ "layouts": {
+  "franka_eef_v1": 44
+ },
+ "mappings": [
+  {
+   "contract_id": 76,
+   "layout_id": 44,
+   "context_id": 44,
+   "representation_id": 1,
+   "mapping_basis": {
+    "arms": "eef_xyz_rotation6d",
+    "hands": "explicit_channel_map"
+   },
+   "source_slots": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+   ],
+   "semantic_slots": [
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    78
+   ],
+   "shared_mask": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "source_roles": [
+    "eef.right.x",
+    "eef.right.y",
+    "eef.right.z",
+    "eef.right.rotation6d.0",
+    "eef.right.rotation6d.1",
+    "eef.right.rotation6d.2",
+    "eef.right.rotation6d.3",
+    "eef.right.rotation6d.4",
+    "eef.right.rotation6d.5",
+    "gripper.right.open_fraction"
+   ]
+  },
+  {
+   "contract_id": 90,
+   "layout_id": 44,
+   "context_id": 44,
+   "representation_id": 2,
+   "mapping_basis": {
+    "arms": "eef_xyz_rotation6d",
+    "hands": "explicit_channel_map"
+   },
+   "source_slots": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+   ],
+   "semantic_slots": [
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    78
+   ],
+   "shared_mask": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "source_roles": [
+    "eef.right.x",
+    "eef.right.y",
+    "eef.right.z",
+    "eef.right.rotation6d.0",
+    "eef.right.rotation6d.1",
+    "eef.right.rotation6d.2",
+    "eef.right.rotation6d.3",
+    "eef.right.rotation6d.4",
+    "eef.right.rotation6d.5",
+    "gripper.right.open_fraction"
+   ]
+  }
+ ]
+}

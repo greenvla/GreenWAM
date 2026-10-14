@@ -1,0 +1,17 @@
+# Drops the module-level import of action_following: the release ships only its bytecode, so the package does not
+# import. The Action Following dimension keeps its lazy import and is not part of EWMScore.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/WorldArena/__init__.py b/video_quality_ood/WorldArena/__init__.py
+index fcda23f..5505e9f 100644
+--- a/video_quality_ood/WorldArena/__init__.py
++++ b/video_quality_ood/WorldArena/__init__.py
+@@ -31,7 +31,6 @@ def _save_results_json(results_json, results_dict, dimension=None):
+ 
+ from .trajectory_accuracy import compute_trajectory_accuracy
+ 
+-from .action_following import compute_action_following
+ from .caption import caption_reference
+ from .semantic_alignment import compute_semantic_alignment
+ 

@@ -1,0 +1,11 @@
+# sha256 of the single-file judge weights the reported evaluation used, relative to $WA_MODELS (sha256sum -c).
+eca3d16b4b5567c9db36ab84d8403e52b148a97a6973cd40898ce74e5405ac84  Tartan-C-T-TSKH-spring540x960-M.pth
+c1dac5b08f4c41e95452f7a41b35347409fc58b0e25b3ba8de899144ff28a350  VFIMamba.pkl
+40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af  ViT-B-32.pt
+2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba  aesthetic_model/emb_reader/sa_0_4_vit_l_14_linear.pth
+b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836  clip_model/ViT-L-14.pt
+bf34ad0f424b9029b593e8dc3ed553bf26e88bcba0d32bf3e62a6209cb64c85e  dino_model/dino_vitbase16_pretrain.pth
+358bb6af275e28ea56821d44fb55c6cb83645db11f394d3ad65b2d149965ab50  pyiqa_model/musiq_spaq_ckpt-358bb6af.pth
+fcfa4125d6418f4de95d84aec20a3c5f4e205101715a79f193243c186ac9a7e1  raft_model/models/raft-things.pth
+133a6909fe46d464940176e0a2c9e0f08c256a1423be1191538083063118629a  v-jepa/ssv2-probe.pth.tar
+6fa02687973a8337c00d999ee3a17d539a0224c4c89b862150e65cbdb2f67b61  v-jepa/vith16.pth.tar

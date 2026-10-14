@@ -1,0 +1,21 @@
+# With the judges sharded over ranks (0001), every rank of the VLM judge wrote its raw answers into the same
+# temporary directory and removed it when done, so the ranks still running lost their remaining videos (empty Interaction
+# Quality, Perspectivity and Instruction Following rows). Each rank now uses and removes its own directory; a single
+# process keeps the original directory.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/VLM_judge.py b/video_quality_ood/VLM_judge.py
+index 1a4338b..c8dba7b 100644
+--- a/video_quality_ood/VLM_judge.py
++++ b/video_quality_ood/VLM_judge.py
+@@ -227,7 +227,8 @@ def normalize_metrics(parsed):
+ 
+ def vlm_judge(model_name, video_dir, summary_json, output_root, tmp_root, metrics_filter, num_frames=16, model_path=None, rank=0, world_size=1):
+     os.makedirs(output_root, exist_ok=True)
+-    tmp_dir = os.path.join(tmp_root, model_name)
++    # one directory per rank: every rank removes its own directory when it is done
++    tmp_dir = os.path.join(tmp_root, model_name if world_size == 1 else f"{model_name}_rank{rank}")
+     os.makedirs(tmp_dir, exist_ok=True)
+ 
+     model_path = model_path or DEFAULT_MODEL_PATH

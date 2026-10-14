@@ -1,0 +1,152 @@
+# Reads the WorldArena 1.0 test layout (test_dataset/video/episodeN.mp4, generated <task>_episode_<n>.mp4) and lists
+# both .jpg and .png frames for PSNR/SSIM.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/WorldArena/basic_metrics.py b/video_quality_ood/WorldArena/basic_metrics.py
+index 238190a..8e79d3f 100644
+--- a/video_quality_ood/WorldArena/basic_metrics.py
++++ b/video_quality_ood/WorldArena/basic_metrics.py
+@@ -11,6 +11,15 @@ def cal_ssim(gt_img, pd_img):
+     return structural_similarity(gt_img, pd_img, channel_axis=-1)
+ 
+ 
++def _list_frames(video_dir):
++    if not os.path.isdir(video_dir):
++        return []
++    paths = []
++    for ext in ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"):
++        paths.extend(glob.glob(os.path.join(video_dir, ext)))
++    return sorted(set(paths))
++
++
+ def compute_basic_metrics(gt_path, pd_path, metric_names=["psnr", "ssim"]):
+ 
+     metric_funcs = dict({
+@@ -21,44 +30,47 @@ def compute_basic_metrics(gt_path, pd_path, metric_names=["psnr", "ssim"]):
+     for _ in metric_names:
+         assert(_ in metric_funcs)
+         res.update({_: dict()})
+-    
++
+     for task_id in sorted(os.listdir(pd_path)):
+         task_path = os.path.join(pd_path, task_id)
+-        
++        if not os.path.isdir(task_path):
++            continue
++
+         for _ in metric_names:
+             res[_][task_id] = {}
+ 
+         for episode_id in tqdm(sorted(os.listdir(task_path))):
+-            if episode_id.endswith(('.png', '.json')): 
++            if episode_id.endswith(('.png', '.json')):
+                 continue
+-            
++
+             for _ in metric_names:
+                 res[_][task_id][episode_id] = {}
+ 
+-            gt_image_list = glob.glob(os.path.join(gt_path, task_id, episode_id, "video", "frame_*.png"))
+-            gt_image_list.sort()
+-            n_frames = len(gt_image_list)
+-
+-            gid_list = sorted(os.listdir(os.path.join(task_path, episode_id)))
++            gt_image_list = _list_frames(os.path.join(gt_path, task_id, episode_id, "video"))
++            episode_dir = os.path.join(task_path, episode_id)
++            gid_list = sorted(
++                g for g in os.listdir(episode_dir)
++                if os.path.isdir(os.path.join(episode_dir, g))
++            )
+             for gid in gid_list:
+-                pd_image_list = glob.glob(os.path.join(task_path, episode_id, gid, "video", "frame_*.png"))
+-                pd_image_list += glob.glob(os.path.join(task_path, episode_id, gid, "video", "frame_*.jpg"))
+-                pd_image_list.sort()
+-                try:
+-                    assert(len(pd_image_list) == n_frames)
+-                except:
+-                    print(len(pd_image_list), n_frames)
+-                cur_metrics = dict()
+-                for pd_img, gt_img in zip(pd_image_list, gt_image_list):
++                pd_image_list = _list_frames(os.path.join(episode_dir, gid, "video"))
++                # Align to generation length; cap by GT if GT is shorter.
++                n_used = min(len(pd_image_list), len(gt_image_list))
++                if n_used == 0:
++                    for _ in metric_names:
++                        res[_][task_id][episode_id].update({gid: 0.0})
++                    continue
++                pd_used = pd_image_list[:n_used]
++                gt_used = gt_image_list[:n_used]
++                cur_metrics = {name: 0.0 for name in metric_names}
++                for pd_img, gt_img in zip(pd_used, gt_used):
+                     pd_img = np.asanyarray(Image.open(pd_img))
+                     gt_img = np.asanyarray(Image.open(gt_img))
+                     if pd_img.shape != gt_img.shape:
+                         pd_img = cv2.resize(pd_img, dsize=tuple(gt_img.shape[:2][::-1]), interpolation=cv2.INTER_CUBIC)
+                     for _ in metric_names:
+-                        if _ not in cur_metrics:
+-                            cur_metrics.update({_: 0.0})
+                         cur_metrics[_] += metric_funcs[_](gt_img, pd_img)
+                 for _ in metric_names:
+-                    res[_][task_id][episode_id].update({gid: cur_metrics[_]/n_frames})
+-    
++                    res[_][task_id][episode_id].update({gid: cur_metrics[_] / n_used})
++
+     return res
+diff --git a/video_quality_ood/preprocess_datasets.py b/video_quality_ood/preprocess_datasets.py
+index 3fc6329..31a463f 100644
+--- a/video_quality_ood/preprocess_datasets.py
++++ b/video_quality_ood/preprocess_datasets.py
+@@ -4,6 +4,29 @@ import cv2
+ import shutil
+ import argparse
+ from pathlib import Path
++
++def robotwin_ids(gt_video_path: Path):
++    """Map official HF test_dataset/video/episodeN.mp4 -> (fixed_scene_task, episodeN)."""
++    stem = gt_video_path.stem
++    if gt_video_path.parent.name == "video" and stem.startswith("episode"):
++        return "fixed_scene_task", stem
++    parts = gt_video_path.parts
++    return parts[-5], stem
++
++
++def find_gen_video(gen_video_dir, id1, id2):
++    n = id2[len("episode"):] if id2.startswith("episode") else id2
++    cands = [
++        Path(gen_video_dir) / f"{id1}_{id2}.mp4",
++        Path(gen_video_dir) / f"{id1}_episode_{n}.mp4",
++        Path(gen_video_dir) / f"{id1}_episode{n}.mp4",
++    ]
++    if str(n).isdigit():
++        cands.append(Path(gen_video_dir) / f"{id1}_episode_{int(n)}.mp4")
++    for c in cands:
++        if c.exists():
++            return c
++    return None
+ from tqdm import tqdm
+ 
+ def parse_args():
+@@ -31,10 +54,7 @@ def extract_frames(video_path, output_dir):
+ def process_item(item, gen_video_dir, output_base):
+     # 1. Extract IDs from a path like /.../327/651177/...
+     gt_video_path = Path(item["gt_path"])
+-    parts = gt_video_path.parts
+-    # Assume the fourth item from the end is ID1 (e.g., 327) and the third is ID2 (e.g., 651177)
+-    # id2 is like episode0.mp4; drop the extension to keep the prefix only
+-    id1, id2 = parts[-5], parts[-1].split('.')[0]
++    id1, id2 = robotwin_ids(gt_video_path)
+     
+     # 2. Build GT path structure
+     gt_root = Path(output_base) / "gt_dataset" / id1 / id2
+@@ -64,8 +84,8 @@ def process_item(item, gen_video_dir, output_base):
+     os.makedirs(video_dir_gen_1, exist_ok=True)
+     
+     # Find generated video (format 327_651177.mp4)
+-    target_gen_video_1 = Path(gen_video_dir)/ f"{id1}_{id2}.mp4"
+-    if target_gen_video_1.exists():
++    target_gen_video_1 = find_gen_video(gen_video_dir, id1, id2)
++    if target_gen_video_1 is not None:
+         extract_frames(target_gen_video_1, video_dir_gen_1)
+     else:
+         print(f"Warning: Generated video not found for {id1}_{id2}")

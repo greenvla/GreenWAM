@@ -1,0 +1,153 @@
+# Keeps per-dimension results and resumes a run from them (psnr and ssim included), and writes result files atomically
+# (several ranks read them while one writes). WORLDARENA_CACHE_DIR sets the cache location.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/WorldArena/__init__.py b/video_quality_ood/WorldArena/__init__.py
+index b324376..fcda23f 100644
+--- a/video_quality_ood/WorldArena/__init__.py
++++ b/video_quality_ood/WorldArena/__init__.py
+@@ -11,6 +11,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ import json
+ 
+ from .distributed import get_rank, print0
++import torch.distributed as dist
++
++
++def _save_results_json(results_json, results_dict, dimension=None):
++    # Rank 0 only. Unique tmp: 8-rank os.replace of the same .tmp races on NFS.
++    if get_rank() == 0:
++        tmp_json = f"{results_json}.tmp.{os.getpid()}"
++        with open(tmp_json, "w") as f:
++            json.dump(results_dict, f, indent=2)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp_json, results_json)
++        if dimension is not None:
++            print0(f"[checkpoint] saved {dimension} -> {results_json}")
++    if dist.is_available() and dist.is_initialized():
++        dist.barrier()
++
+ 
+ from .trajectory_accuracy import compute_trajectory_accuracy
+ 
+@@ -152,7 +169,9 @@ class WorldArenaBenchmark(object):
+             'photometric_smoothness',
+             'motion_smoothness',
+             'image_quality',
+-            'subject_consistency'
++            'subject_consistency',
++            'psnr',
++            'ssim',
+         ]        
+ 
+ 
+@@ -225,18 +244,31 @@ class WorldArenaBenchmark(object):
+ 
+         json_path = os.path.join(self.output_path, f"{data_name}_results.json")
+ 
+-        if overwrite and os.path.exists(json_path):
+-            print0(f"[overwrite] Removing existing results at {json_path}")
++        if dimension_list is None:
++            dimension_list = self.build_full_dimension_list()
++
++        if overwrite:
++            results_dict = {}
++            if os.path.exists(json_path):
++                print0(f"[overwrite] ignoring existing {json_path}")
++        elif os.path.exists(json_path):
+             try:
+-                os.remove(json_path)
+-            except OSError as exc:
+-                print0(f"[overwrite] Warning: failed to remove {json_path}: {exc}")
++                if os.path.getsize(json_path) == 0:
++                    raise json.JSONDecodeError("empty", "", 0)
++                with open(json_path, "r") as f:
++                    results_dict = json.load(f)
++                if not isinstance(results_dict, dict):
++                    results_dict = {}
++                print0(f"[resume] loaded {json_path} keys={list(results_dict)}")
++            except (json.JSONDecodeError, OSError) as e:
++                print0(f"[resume] unreadable {json_path}: {e}; starting fresh")
++                results_dict = {}
++        else:
++            results_dict = {}
+ 
+-        if (not os.path.exists(json_path)) or overwrite:
++        if True:
+ 
+-            results_dict = {}
+-            
+-            if dimension_list is None:
++            if False:
+                 dimension_list = self.build_full_dimension_list()
+ 
+             if "psnr" in dimension_list and "ssim" in dimension_list:
+@@ -248,6 +280,17 @@ class WorldArenaBenchmark(object):
+ 
+             submodules_dict = init_submodules(dimension_list, local=local, **kwargs)
+ 
++            pending = []
++            for d in dimension_list:
++                if d == "psnr_ssim":
++                    if not ("psnr" in results_dict and "ssim" in results_dict):
++                        pending.append(d)
++                elif d not in results_dict:
++                    pending.append(d)
++            if not pending:
++                print0("[resume] all requested dimensions already present")
++            dimension_list = pending
++
+             for dimension in dimension_list:
+                 
+                 print0(f"Evaluating: {dimension}")
+@@ -418,16 +461,13 @@ class WorldArenaBenchmark(object):
+                     results_dict["ssim"] = results["ssim"]
+                 else:
+                     results_dict[dimension] = results
+-            
+ 
+-            results_json = os.path.join(self.output_path,f'{data_name}_results.json')    
+-            with open(results_json, "w") as f:
+-                json.dump(results_dict, f, indent=2)
+-
+-        else:
++                results_json = os.path.join(self.output_path, f"{data_name}_results.json")
++                _save_results_json(results_json, results_dict, dimension)
+ 
+-            with open(json_path, "r") as f:
+-                results_dict = json.load(f)
++            if pending:
++                results_json = os.path.join(self.output_path, f"{data_name}_results.json")
++                _save_results_json(results_json, results_dict)
+ 
+ 
+ 
+diff --git a/video_quality_ood/WorldArena/utils.py b/video_quality_ood/WorldArena/utils.py
+index ab2ad87..56d6015 100644
+--- a/video_quality_ood/WorldArena/utils.py
++++ b/video_quality_ood/WorldArena/utils.py
+@@ -23,6 +23,11 @@ except ImportError:
+     BILINEAR = Image.BILINEAR
+ 
+ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
++CACHE_DIR = os.environ.get(
++    "WORLDARENA_CACHE_DIR",
++    os.path.join(os.path.dirname(PROJECT_ROOT), ".cache", "WorldArena"),
++)
++os.makedirs(CACHE_DIR, exist_ok=True)
+ 
+ 
+ from .distributed import (
+@@ -345,8 +350,10 @@ def init_submodules(dimension_list, local=False, **kwargs):
+ 
+ 
+ def save_json(data, path, indent=4):
+-    with open(path, 'w', encoding='utf-8') as f:
++    tmp = f"{path}.tmp.{os.getpid()}"
++    with open(tmp, 'w', encoding='utf-8') as f:
+         json.dump(data, f, indent=indent)
++    os.replace(tmp, path)  # atomic: other ranks read this file concurrently
+ 
+ def load_json(path):
+     """

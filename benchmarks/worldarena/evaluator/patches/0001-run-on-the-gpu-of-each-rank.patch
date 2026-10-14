@@ -1,0 +1,280 @@
+# Runs every metric model on the GPU of its rank instead of cuda:0, sets the device of torch.distributed ranks, and shards
+# detection/tracking and VLM judging over --rank/--world-size. VLM judging also matches generated videos named
+# <task>_episode_<n>.mp4. No metric computation changes.
+#
+# Applies to WorldArena-2.0 @ 5978ce5 (tree video_quality_ood/), in order.
+
+diff --git a/video_quality_ood/VLM_judge.py b/video_quality_ood/VLM_judge.py
+index 0d242e9..1a4338b 100644
+--- a/video_quality_ood/VLM_judge.py
++++ b/video_quality_ood/VLM_judge.py
+@@ -31,15 +31,25 @@ def load_instruction_json(json_path):
+         else:
+             instruction = ""
+ 
++        names = []
++        raw_name = item.get("name")
++        if raw_name:
++            names.append(raw_name if str(raw_name).endswith(".mp4") else f"{raw_name}.mp4")
+         path_obj = Path(gt_path)
+-        if len(path_obj.parts) >= 5:
+-            generated_filename = f"{path_obj.parts[-1].split('.')[0]}.mp4"
+-        else:
+-            base_name = os.path.basename(gt_path)
+-            generated_filename = f"unknown_{base_name}"
+-
+-        instruction_map[generated_filename] = instruction
+-        valid_video_basenames.add(generated_filename)
++        if path_obj.name:
++            names.append(path_obj.name if path_obj.name.endswith(".mp4") else f"{path_obj.stem}.mp4")
++        stem = path_obj.stem
++        if stem.startswith("episode") and stem[len("episode"):].isdigit():
++            names.append(f"fixed_scene_task_episode_{int(stem[len('episode'):])}.mp4")
++        ep = item.get("episode")
++        if ep is not None:
++            names.append(f"fixed_scene_task_episode_{ep}.mp4")
++        if not names:
++            names.append(f"unknown_{os.path.basename(gt_path)}")
++
++        for generated_filename in names:
++            instruction_map[generated_filename] = instruction
++            valid_video_basenames.add(generated_filename)
+ 
+     return instruction_map, valid_video_basenames
+ 
+@@ -215,7 +225,7 @@ def normalize_metrics(parsed):
+     return metrics
+ 
+ 
+-def vlm_judge(model_name, video_dir, summary_json, output_root, tmp_root, metrics_filter, num_frames=16, model_path=None):
++def vlm_judge(model_name, video_dir, summary_json, output_root, tmp_root, metrics_filter, num_frames=16, model_path=None, rank=0, world_size=1):
+     os.makedirs(output_root, exist_ok=True)
+     tmp_dir = os.path.join(tmp_root, model_name)
+     os.makedirs(tmp_dir, exist_ok=True)
+@@ -233,6 +243,9 @@ def vlm_judge(model_name, video_dir, summary_json, output_root, tmp_root, metric
+         if fname.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm")) and fname in valid_names:
+             videos.append(os.path.join(video_dir, fname))
+     videos.sort()
++    if world_size > 1:
++        videos = videos[rank::world_size]
++        print(f"[VLM] shard rank={rank}/{world_size} n={len(videos)}", flush=True)
+ 
+     results = []
+     for video_path in tqdm(videos, desc=f"{model_name} evaluating", ncols=100):
+@@ -269,7 +282,8 @@ def vlm_judge(model_name, video_dir, summary_json, output_root, tmp_root, metric
+     # Save final aggregated results
+     out_dir = os.path.join(output_root, model_name)
+     os.makedirs(out_dir, exist_ok=True)
+-    out_file = os.path.join(out_dir, f"{model_name}_summary_val_all_intern.json")
++    suffix = f"_rank{rank}" if world_size > 1 else ""
++    out_file = os.path.join(out_dir, f"{model_name}_summary_val_all_intern{suffix}.json")
+     with open(out_file, "w", encoding="utf-8") as f:
+         json.dump(results, f, ensure_ascii=False, indent=2)
+ 
+@@ -292,6 +306,8 @@ def main():
+     parser.add_argument("--tmp_root", default="tmp_VLM")
+     parser.add_argument("--num_frames", type=int, default=16)
+     parser.add_argument("--config_path", default="video_quality/config/config.yaml")
++    parser.add_argument("--rank", type=int, default=0)
++    parser.add_argument("--world-size", type=int, default=1)
+     args = parser.parse_args()
+ 
+     # load model path from config
+@@ -313,6 +329,8 @@ def main():
+         metrics_filter=args.metrics,
+         num_frames=args.num_frames,
+         model_path=model_path,
++        rank=args.rank,
++        world_size=args.world_size,
+     )
+     print(f"Saved results to {out_file}")
+ 
+diff --git a/video_quality_ood/WorldArena/aesthetic_quality.py b/video_quality_ood/WorldArena/aesthetic_quality.py
+index bb51167..1cc0e2d 100644
+--- a/video_quality_ood/WorldArena/aesthetic_quality.py
++++ b/video_quality_ood/WorldArena/aesthetic_quality.py
+@@ -85,7 +85,7 @@ def laion_aesthetic(aesthetic_model, clip_model, video_list, device):
+ 
+ 
+ def compute_aesthetic_quality(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     vit_path = submodules_list.get('clip_model')
+     aes_path = submodules_list.get('aesthetic_head')
+     if vit_path is None or aes_path is None:
+diff --git a/video_quality_ood/WorldArena/background_consistency.py b/video_quality_ood/WorldArena/background_consistency.py
+index 753e7d7..c12dd5a 100644
+--- a/video_quality_ood/WorldArena/background_consistency.py
++++ b/video_quality_ood/WorldArena/background_consistency.py
+@@ -78,7 +78,7 @@ def background_consistency(clip_model, preprocess, video_list, device, read_fram
+ 
+ 
+ def compute_background_consistency(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     vit_path = submodules_list.get('clip_model')
+     raft_model_path = submodules_list.get('raft_model')
+     read_frame = submodules_list.get('read_frame', False)
+diff --git a/video_quality_ood/WorldArena/depth_accuracy.py b/video_quality_ood/WorldArena/depth_accuracy.py
+index 1d2b847..41ff466 100644
+--- a/video_quality_ood/WorldArena/depth_accuracy.py
++++ b/video_quality_ood/WorldArena/depth_accuracy.py
+@@ -125,7 +125,7 @@ def depth_accuracy(depth_model, video_list, gt_root, device):
+     return all_results, video_results
+ 
+ def compute_depth_accuracy(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     gt_path = kwargs.get('gt_path', None)
+     if not gt_path:
+         raise ValueError("depth_accuracy 需要 gt_path 参数")
+diff --git a/video_quality_ood/WorldArena/distributed.py b/video_quality_ood/WorldArena/distributed.py
+index fb536db..a477f11 100644
+--- a/video_quality_ood/WorldArena/distributed.py
++++ b/video_quality_ood/WorldArena/distributed.py
+@@ -22,6 +22,9 @@ def print0(*args, **kwargs):
+ 
+ 
+ def dist_init():
++    if torch.distributed.is_initialized():
++        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
++        return
+     if 'MASTER_ADDR' not in os.environ:
+         os.environ['MASTER_ADDR'] = 'localhost'
+     if 'MASTER_PORT' not in os.environ:
+diff --git a/video_quality_ood/WorldArena/dynamic_degree.py b/video_quality_ood/WorldArena/dynamic_degree.py
+index 4dd1bfe..74d9a6b 100644
+--- a/video_quality_ood/WorldArena/dynamic_degree.py
++++ b/video_quality_ood/WorldArena/dynamic_degree.py
+@@ -166,7 +166,7 @@ def dynamic_degree(dynamic, video_list):
+ 
+ 
+ def compute_dynamic_degree(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     model_path = submodules_list["model"]
+     if model_path is None:
+         raise ValueError("dynamic_degree requires raft checkpoint from config")
+diff --git a/video_quality_ood/WorldArena/flow_aepe_metrics.py b/video_quality_ood/WorldArena/flow_aepe_metrics.py
+index 39e8fd8..0e568c9 100644
+--- a/video_quality_ood/WorldArena/flow_aepe_metrics.py
++++ b/video_quality_ood/WorldArena/flow_aepe_metrics.py
+@@ -90,7 +90,7 @@ class OpticalFlowAverageEndPointErrorMetric:
+     """
+     
+     def __init__(self, cfg_path=None, checkpoint_path=None, device=None) -> None:
+-        self._device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++        self._device = device or torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+ 
+         cfg_resolved = Path(cfg_path) if cfg_path else DEFAULT_CFG
+         ckpt_resolved = Path(checkpoint_path) if checkpoint_path else DEFAULT_CKPT
+@@ -213,7 +213,7 @@ class OpticalFlowAverageEndPointErrorMetric:
+ 
+ 
+ def compute_photometric_smoothness(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     cfg_path = submodules_list.get("config") or DEFAULT_CFG
+     model_path = submodules_list.get("model") or DEFAULT_CKPT
+ 
+diff --git a/video_quality_ood/WorldArena/flow_score.py b/video_quality_ood/WorldArena/flow_score.py
+index 6494cea..c7f8b61 100644
+--- a/video_quality_ood/WorldArena/flow_score.py
++++ b/video_quality_ood/WorldArena/flow_score.py
+@@ -105,7 +105,7 @@ def flow_score(flow_scorer, video_list):
+ 
+ 
+ def compute_flow_score(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     model_path = submodules_list.get("model")
+     if model_path is None:
+         raise ValueError("flow_score requires raft checkpoint from config")
+diff --git a/video_quality_ood/WorldArena/imaging_quality.py b/video_quality_ood/WorldArena/imaging_quality.py
+index f2c64be..82f7b20 100644
+--- a/video_quality_ood/WorldArena/imaging_quality.py
++++ b/video_quality_ood/WorldArena/imaging_quality.py
+@@ -57,7 +57,7 @@ def technical_quality(model, video_list, device, **kwargs):
+ 
+ 
+ def compute_imaging_quality(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     model_path = submodules_list['model_path']
+ 
+     model = MUSIQ(pretrained_model_path=model_path)
+diff --git a/video_quality_ood/WorldArena/motion_smoothness_metrics.py b/video_quality_ood/WorldArena/motion_smoothness_metrics.py
+index 5f07b64..29def60 100644
+--- a/video_quality_ood/WorldArena/motion_smoothness_metrics.py
++++ b/video_quality_ood/WorldArena/motion_smoothness_metrics.py
+@@ -35,7 +35,7 @@ class MotionSmoothnessMetric:
+     """Motion smoothness via VFI model with SSIM weighting."""
+ 
+     def __init__(self, ckpt_path=None, device=None) -> None:
+-        self._device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++        self._device = device or torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+ 
+         model = Model(-1)
+         ckpt_resolved = Path(ckpt_path) if ckpt_path else DEFAULT_VFIMAMBA_CKPT
+@@ -99,7 +99,7 @@ class MotionSmoothnessMetric:
+ 
+ 
+ def compute_motion_smoothness(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     model_path = submodules_list.get("model") or DEFAULT_VFIMAMBA_CKPT
+ 
+     metric = MotionSmoothnessMetric(model_path, device=device)
+diff --git a/video_quality_ood/WorldArena/subject_consistency.py b/video_quality_ood/WorldArena/subject_consistency.py
+index 4530dba..7b92553 100644
+--- a/video_quality_ood/WorldArena/subject_consistency.py
++++ b/video_quality_ood/WorldArena/subject_consistency.py
+@@ -88,7 +88,7 @@ def subject_consistency(model, video_list, device, read_frame, raft_model_path):
+ 
+ 
+ def compute_subject_consistency(json_dir, submodules_list, **kwargs):
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+     submodules_kwargs = dict(submodules_list)
+     read_frame = submodules_kwargs.pop('read_frame', False)
+     raft_model_path = submodules_kwargs.pop('raft_model', None)
+diff --git a/video_quality_ood/processing/detection_tracking.py b/video_quality_ood/processing/detection_tracking.py
+index 62a5b8f..b33e3fc 100644
+--- a/video_quality_ood/processing/detection_tracking.py
++++ b/video_quality_ood/processing/detection_tracking.py
+@@ -596,6 +596,10 @@ if __name__ == "__main__":
+                        help='Whether to detect ground-truth trajectories')
+     parser.add_argument('--force_reprocess', action='store_true',
+                        help='Force reprocess all videos even if outputs exist')
++    parser.add_argument('--rank', type=int, default=0,
++                       help='Shard index when running multiple 1-GPU replicas')
++    parser.add_argument('--world-size', type=int, default=1,
++                       help='Number of independent detection replicas')
+     args = parser.parse_args()
+     
+     config = load_config(args.config_path)
+@@ -614,6 +618,7 @@ if __name__ == "__main__":
+     print("2. Trajectory lines drawn in red")
+     print("3. Post-process with interpolation and smoothing")
+     print(f"Force reprocess: {'yes' if args.force_reprocess else 'no'}")
++    print(f"Shard: rank={args.rank} world_size={args.world_size}")
+     print("=" * 60)
+     
+     # ===== Load model once =====
+@@ -636,10 +641,13 @@ if __name__ == "__main__":
+         if not os.path.isdir(task_path):
+             continue
+             
+-        for episode in sorted(os.listdir(task_path)):
+-            if episode.endswith(('.png', '.json')):
++        episodes = [
++            e for e in sorted(os.listdir(task_path))
++            if not e.endswith(('.png', '.json'))
++        ]
++        for ep_idx, episode in enumerate(episodes):
++            if ep_idx % args.world_size != args.rank:
+                 continue
+-                
+             episode_path = os.path.join(task_path, episode)
+             
+             # Process ground-truth videos
