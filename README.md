@@ -6,7 +6,7 @@
 
 <p align="center">
 Gennady Sidorov, Valerii Kornilov, Denis Grankin, Polina Fedotova, Aleksey Postnikov<br>
-<sub>Manipulation Team, Sber Robotics Center</sub>
+<sub>Brain Team, Sber Robotics Center</sub>
 </p>
 
 <p align="center">
